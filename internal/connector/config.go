@@ -192,6 +192,10 @@ func (c Config) Validate() error {
 		return fmt.Errorf("a manifest is required (set AURORA_MANIFEST or AURORA_MANIFEST_FILE)")
 	case c.InteractionsPath != "" && c.InteractionsPath == c.EventsPath:
 		return fmt.Errorf("EVENTS_PATH and INTERACTIONS_PATH must differ")
+	case c.PollInterval <= 0:
+		return fmt.Errorf("POLL_INTERVAL must be positive")
+	case c.ProcessTimeout <= 0:
+		return fmt.Errorf("PROCESS_TIMEOUT must be positive")
 	}
 	return nil
 }

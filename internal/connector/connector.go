@@ -189,23 +189,33 @@ func (c *Connector) dispatchEvent(env slackEnvelope) {
 		return
 	}
 
+	// A threaded reply carries thread_ts; a top-level message opens a new thread
+	// keyed by its own ts.
+	isReply := ev.ThreadTS != ""
 	threadTS := ev.ThreadTS
-	if threadTS == "" {
+	if !isReply {
 		threadTS = ev.TS
 	}
 	text := c.cleanText(ev.Text)
 	if text == "" {
 		return
 	}
-	trigger := ev.Type == "app_mention" || c.hasTrigger(ev.Text)
-	c.deliver(threadTS, text, trigger)
+	// Decide "trigger" from the message text (a native bot mention or the
+	// keyword), not the event type. Slack delivers one native @-mention as both
+	// an app_mention and a message with the same (channel, ts); dedup keeps only
+	// one, so a type-dependent decision would fire nondeterministically. The
+	// app_mention type is kept only as a fallback for when we couldn't resolve
+	// our own user id.
+	trigger := c.mentionsBot(ev.Text) || c.hasTrigger(ev.Text) ||
+		(c.botUserID == "" && ev.Type == "app_mention")
+	c.deliver(threadTS, text, trigger, isReply)
 }
 
 // deliver routes a cleaned message to the right thread worker, (re)attaching the
 // aurora session as needed. A trigger (a mention or the configured keyword)
 // starts a new duty thread; a plain message is served only if the thread is
 // already ours (an active worker, or an existing session by name).
-func (c *Connector) deliver(threadTS, text string, trigger bool) {
+func (c *Connector) deliver(threadTS, text string, trigger, isReply bool) {
 	// Fast path: a live worker already serves this thread.
 	c.mu.Lock()
 	if t, ok := c.threads[threadTS]; ok {
@@ -216,9 +226,12 @@ func (c *Connector) deliver(threadTS, text string, trigger bool) {
 	c.mu.Unlock()
 
 	if !trigger {
-		// Not a trigger and no live worker: reattach only if this thread already
-		// has a session (the bot was invoked here before). Otherwise it's just
-		// channel chatter — ignore it.
+		// Not a trigger and no live worker. Only a threaded reply can belong to a
+		// bot thread whose worker has retired; a fresh top-level message never
+		// does, so ordinary channel chatter is dropped without a session lookup.
+		if !isReply {
+			return
+		}
 		sessionID, err := c.aurora.FindSessionByName(c.ctx, sessionName(threadTS))
 		if err != nil {
 			c.logger.Warn("lookup session by name", "thread", threadTS, "error", err)
@@ -509,6 +522,15 @@ func (c *Connector) cleanText(text string) string {
 func (c *Connector) hasTrigger(text string) bool {
 	kw := c.cfg.TriggerKeyword
 	return kw != "" && strings.Contains(strings.ToLower(text), strings.ToLower(kw))
+}
+
+// mentionsBot reports whether text contains a native @-mention of this bot
+// (matching both "<@U123>" and the labelled "<@U123|name>"). Because both the
+// app_mention and message deliveries of one user message carry the same text,
+// deciding "trigger" from this — rather than the event type — makes the two
+// siblings agree no matter which wins de-duplication.
+func (c *Connector) mentionsBot(text string) bool {
+	return c.botUserID != "" && strings.Contains(text, "<@"+c.botUserID)
 }
 
 func sessionName(threadTS string) string { return "slack:" + threadTS }

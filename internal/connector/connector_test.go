@@ -290,6 +290,32 @@ func TestConnectorEndToEnd(t *testing.T) {
 	}
 }
 
+// A native @-mention is delivered as both an app_mention and a message with the
+// same ts; dedup keeps only one. The trigger decision must not depend on which
+// sibling wins, so the message-typed sibling (no literal keyword) must still
+// open a thread — otherwise ~half of first-contact mentions are dropped.
+func TestMessageSiblingOfNativeMentionTriggers(t *testing.T) {
+	a := newAuroraStub()
+	defer a.close()
+	sl := newSlackStub()
+	defer sl.close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	conn := newTestConnector(t, a, sl)
+	conn.Start(ctx) // resolves botUserID = UBOT
+
+	ev := mentionEvent("U1", "<@UBOT> check the db", "200.1", "")
+	ev.Event.Type = "message" // the message sibling, not app_mention
+	conn.dispatchEvent(ev)
+
+	waitForPost(t, sl.postCh, "Re: check the db", 3*time.Second)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.processCreates != 1 {
+		t.Fatalf("native mention via message event did not trigger: %d processes", a.processCreates)
+	}
+}
+
 func TestConnectorIgnoresOtherChannelsAndBots(t *testing.T) {
 	a := newAuroraStub()
 	defer a.close()
