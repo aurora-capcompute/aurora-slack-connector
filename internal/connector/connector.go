@@ -92,6 +92,11 @@ func (c *Connector) Start(ctx context.Context) {
 func (c *Connector) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST "+c.cfg.EventsPath, c.handleEvents)
+	if p := c.cfg.InteractionsPath; p != "" && p != c.cfg.EventsPath {
+		// Interactive Approve/Deny button clicks land here (Slack's
+		// Interactivity request URL) — the human-in-the-loop path.
+		mux.HandleFunc("POST "+p, c.handleInteractions)
+	}
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
@@ -141,10 +146,11 @@ func (c *Connector) handleEvents(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(env.Challenge))
 		return
 	}
-	// Ack fast (Slack demands a 200 within 3s) and do the work asynchronously.
+	// Ack fast (Slack demands a 200 within 3s) and do the work asynchronously —
+	// the downstream aurora calls must not hold the response open.
 	w.WriteHeader(http.StatusOK)
 	if env.Type == "event_callback" {
-		c.dispatchEvent(env)
+		go c.dispatchEvent(env)
 	}
 }
 
@@ -302,7 +308,7 @@ func (c *Connector) runThread(t *thread) {
 // back into the thread. It blocks the worker until the process finishes, which
 // is exactly the per-thread serialization we want.
 func (c *Connector) handleMessage(ctx context.Context, t *thread, text string) {
-	statusTS, err := c.slack.PostMessage(ctx, c.cfg.ChannelID, t.threadTS, statusHeader(StatusQueued))
+	statusTS, err := c.slack.PostMessage(ctx, c.cfg.ChannelID, t.threadTS, statusHeader(StatusQueued, false))
 	if err != nil {
 		c.logger.Warn("post status message", "thread", t.threadTS, "error", err)
 		// Without a status message we can still run; progress just won't render.
@@ -362,8 +368,9 @@ func (c *Connector) waitSessionIdle(ctx context.Context, sessionID string, deadl
 
 // pollProcess watches a running process and keeps the thread's status message
 // current: the cheap process poll drives the loop, and the session log is
-// fetched only when the journal grows (or the process ends) to render the
-// syscall timeline. On a terminal status it posts the final answer or error.
+// fetched when the journal grows, the process is parked on a task, or it ends —
+// both to render the syscall timeline and to surface human-in-the-loop
+// approvals. On a terminal status it posts the final answer or error.
 func (c *Connector) pollProcess(ctx context.Context, t *thread, processID, statusTS string) {
 	deadline := time.Now().Add(c.cfg.ProcessTimeout)
 	ticker := time.NewTicker(c.cfg.PollInterval)
@@ -372,22 +379,47 @@ func (c *Connector) pollProcess(ctx context.Context, t *thread, processID, statu
 	lastJournalLen := -1
 	lastText := ""
 	var entries []JournalEntry
+	var tasks []Task
+	prompted := map[string]bool{} // task ids we've already posted an approval prompt for
 
 	for {
 		snap, err := c.aurora.GetProcess(ctx, processID)
 		if err != nil {
 			c.logger.Warn("poll process", "process", processID, "error", err)
 		} else {
-			if snap.JournalLength != lastJournalLen || IsTerminal(snap.Status) {
+			// Refresh the log when the journal grows, the process ends, or it is
+			// parked on a task (so a newly-created approval is seen promptly even
+			// though it did not change the journal length).
+			if snap.JournalLength != lastJournalLen || IsTerminal(snap.Status) || snap.Status == StatusWaitingTask {
 				if log, lerr := c.aurora.GetSessionLog(ctx, t.sessionID); lerr != nil {
 					c.logger.Warn("fetch session log", "session", t.sessionID, "error", lerr)
 				} else if pl := log.Process(processID); pl != nil {
 					entries = pl.Entries
+					tasks = pl.Tasks
 				}
 				lastJournalLen = snap.JournalLength
 			}
+
+			// Surface any pending human approvals as interactive prompts (once
+			// each), and hold the timeout open while a human is deciding — a
+			// person taking their time is not the connector stalling.
+			awaiting := false
+			for _, tk := range tasks {
+				if !tk.NeedsHumanDecision() {
+					continue
+				}
+				awaiting = true
+				if !prompted[tk.ID] {
+					c.postApprovalPrompt(ctx, t, tk)
+					prompted[tk.ID] = true
+				}
+			}
+			if awaiting {
+				deadline = time.Now().Add(c.cfg.ProcessTimeout)
+			}
+
 			running := !IsTerminal(snap.Status)
-			if text := renderStatus(statusHeader(snap.Status), entries, running); text != lastText && statusTS != "" {
+			if text := renderStatus(statusHeader(snap.Status, awaiting), entries, running); text != lastText && statusTS != "" {
 				if err := c.slack.UpdateMessage(ctx, c.cfg.ChannelID, statusTS, text); err != nil {
 					c.logger.Warn("update status", "error", err)
 				} else {
@@ -472,7 +504,10 @@ func (c *Connector) hasTrigger(text string) bool {
 
 func sessionName(threadTS string) string { return "slack:" + threadTS }
 
-func statusHeader(status string) string {
+func statusHeader(status string, awaitingApproval bool) string {
+	if awaitingApproval {
+		return "⏸️ *Duty bot — waiting for your approval*"
+	}
 	switch status {
 	case StatusCompleted:
 		return "✅ *Duty bot — done*"
@@ -483,7 +518,7 @@ func statusHeader(status string) string {
 	case StatusCompensated:
 		return "↩️ *Duty bot — rolled back*"
 	case StatusWaitingTask:
-		return "🛎️ *Duty bot — working* _(waiting on a task)_"
+		return "🛎️ *Duty bot — working* _(waiting on a timer)_"
 	default:
 		return "🛎️ *Duty bot — working…*"
 	}

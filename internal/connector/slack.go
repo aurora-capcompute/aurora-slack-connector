@@ -83,10 +83,27 @@ func (c *SlackClient) PostMessage(ctx context.Context, channel, threadTS, text s
 
 // UpdateMessage edits an existing message in place — used to keep a single
 // status line current as syscalls come and go, rather than flooding the thread.
+// Passing text (and no blocks) also clears any blocks the message had, which is
+// how an approval prompt's buttons are removed once the decision is made.
 func (c *SlackClient) UpdateMessage(ctx context.Context, channel, ts, text string) error {
-	body := map[string]any{"channel": channel, "ts": ts, "text": text}
+	body := map[string]any{"channel": channel, "ts": ts, "text": text, "blocks": []any{}}
 	var out slackResponse
 	return c.call(ctx, "chat.update", body, &out)
+}
+
+// PostBlockMessage posts a Block Kit message into a thread. text is the
+// notification/accessibility fallback; blocks is the rich layout (e.g. an
+// approval prompt with buttons). Returns the new message's ts.
+func (c *SlackClient) PostBlockMessage(ctx context.Context, channel, threadTS, text string, blocks []map[string]any) (string, error) {
+	body := map[string]any{"channel": channel, "text": text, "blocks": blocks}
+	if threadTS != "" {
+		body["thread_ts"] = threadTS
+	}
+	var out slackResponse
+	if err := c.call(ctx, "chat.postMessage", body, &out); err != nil {
+		return "", err
+	}
+	return out.TS, nil
 }
 
 func (c *SlackClient) call(ctx context.Context, method string, body map[string]any, out *slackResponse) error {

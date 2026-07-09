@@ -190,6 +190,7 @@ func newTestConnector(t *testing.T, a *auroraStub, sl *slackStub) *Connector {
 		ChannelID:          "C1",
 		TriggerKeyword:     "@duty",
 		EventsPath:         "/slack/events",
+		InteractionsPath:   "/slack/interactions",
 		AuroraBaseURL:      a.server.URL,
 		Manifest:           json.RawMessage(`{"version":4}`),
 		PollInterval:       5 * time.Millisecond,

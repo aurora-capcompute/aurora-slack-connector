@@ -52,6 +52,10 @@ type Config struct {
 	Addr string
 	// EventsPath is the path Slack posts events to (default /slack/events).
 	EventsPath string
+	// InteractionsPath is the path Slack posts interactive actions to — the
+	// Approve/Deny button clicks (default /slack/interactions). Must differ from
+	// EventsPath.
+	InteractionsPath string
 
 	// --- Polling ---
 
@@ -79,6 +83,7 @@ func LoadConfig() (Config, error) {
 		AuroraBaseURL:      strings.TrimSpace(os.Getenv("AURORA_BASE_URL")),
 		Addr:               strings.TrimSpace(os.Getenv("ADDR")),
 		EventsPath:         strings.TrimSpace(os.Getenv("EVENTS_PATH")),
+		InteractionsPath:   strings.TrimSpace(os.Getenv("INTERACTIONS_PATH")),
 	}
 
 	if cfg.AuroraBaseURL == "" {
@@ -89,6 +94,9 @@ func LoadConfig() (Config, error) {
 	}
 	if cfg.EventsPath == "" {
 		cfg.EventsPath = "/slack/events"
+	}
+	if cfg.InteractionsPath == "" {
+		cfg.InteractionsPath = "/slack/interactions"
 	}
 	if cfg.TriggerKeyword == "" {
 		cfg.TriggerKeyword = "@duty"
@@ -172,6 +180,8 @@ func (c Config) Validate() error {
 		return fmt.Errorf("SLACK_CHANNEL_ID is required")
 	case len(c.Manifest) == 0:
 		return fmt.Errorf("a manifest is required (set AURORA_MANIFEST or AURORA_MANIFEST_FILE)")
+	case c.InteractionsPath != "" && c.InteractionsPath == c.EventsPath:
+		return fmt.Errorf("EVENTS_PATH and INTERACTIONS_PATH must differ")
 	}
 	return nil
 }

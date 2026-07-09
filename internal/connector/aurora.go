@@ -90,8 +90,9 @@ type SessionLog struct {
 	Processes []ProcessLog `json:"processes"`
 }
 
-// ProcessLog is one process inside the session log: its snapshot fields plus the
-// flat journal of every syscall it has issued.
+// ProcessLog is one process inside the session log: its snapshot fields, the
+// flat journal of every syscall it has issued, and its tasks (durable
+// approvals/timers the process is parked on or has resolved).
 type ProcessLog struct {
 	ID            string         `json:"id"`
 	Status        string         `json:"status"`
@@ -99,6 +100,53 @@ type ProcessLog struct {
 	Error         string         `json:"error"`
 	JournalLength int            `json:"journal_length"`
 	Entries       []JournalEntry `json:"entries"`
+	Tasks         []Task         `json:"tasks"`
+}
+
+// Task states, mirrored from aurora's task.State (= sys.Decision). A pending
+// task is one awaiting resolution; a human-approvable one parks the process in
+// waiting_for_task until POST /v1/tasks/{id}/resolve settles it.
+const (
+	TaskPending   = "pending"
+	TaskApproved  = "approved"
+	TaskCompleted = "completed"
+	TaskDenied    = "denied"
+	TaskFailed    = "failed"
+	TaskCancelled = "cancelled"
+	TaskExpired   = "expired"
+	TaskExecuted  = "executed"
+)
+
+// Resolution decisions accepted by POST /v1/tasks/{id}/resolve. For a duty bot's
+// human-in-the-loop approvals only two matter: approve lets the syscall proceed,
+// deny refuses it (the guest sees a denied result and reacts).
+const (
+	DecisionApproved = "approved"
+	DecisionDenied   = "denied"
+)
+
+// Task is one durable task on a process (GET /v1/sessions/{id} →
+// processes[].tasks[]). The connector reads pending human approvals from here —
+// including the ResolutionToken, the bearer credential it presents back to
+// resolve the task — and renders Summary/Syscall into the Slack prompt.
+type Task struct {
+	ID        string `json:"id"`
+	ProcessID string `json:"process_id"`
+	Summary   string `json:"summary"`
+	State     string `json:"state"`
+	Syscall   struct {
+		Name string          `json:"name"`
+		Args json.RawMessage `json:"args,omitempty"`
+	} `json:"syscall"`
+	ResolutionToken string     `json:"resolution_token"`
+	ExpiresAt       *time.Time `json:"expires_at,omitempty"`
+}
+
+// NeedsHumanDecision reports whether a task is a pending approval awaiting a
+// human — as opposed to a timer park (sys.timer), which the runtime's timer
+// actor resolves on its own and which no one should be prompted about.
+func (t Task) NeedsHumanDecision() bool {
+	return t.State == TaskPending && t.Syscall.Name != "sys.timer"
 }
 
 // JournalEntry is one syscall of a process's journal. Outcome.Status is one of
@@ -121,6 +169,20 @@ func (l *SessionLog) Process(processID string) *ProcessLog {
 	for i := range l.Processes {
 		if l.Processes[i].ID == processID {
 			return &l.Processes[i]
+		}
+	}
+	return nil
+}
+
+// Task finds a task by id across all of the session's processes, or nil if
+// absent — used to look a task's current state and resolution token back up
+// when a human clicks Approve/Deny.
+func (l *SessionLog) Task(taskID string) *Task {
+	for i := range l.Processes {
+		for j := range l.Processes[i].Tasks {
+			if l.Processes[i].Tasks[j].ID == taskID {
+				return &l.Processes[i].Tasks[j]
+			}
 		}
 	}
 	return nil
@@ -242,10 +304,29 @@ func (c *AuroraClient) GetProcess(ctx context.Context, processID string) (Proces
 }
 
 // GetSessionLog reads the whole session log — the only place the per-syscall
-// journal is exposed.
+// journal and the per-process tasks are exposed.
 func (c *AuroraClient) GetSessionLog(ctx context.Context, sessionID string) (SessionLog, error) {
 	var out SessionLog
 	err := c.do(ctx, http.MethodGet, "/v1/sessions/"+sessionID, nil, &out)
+	return out, err
+}
+
+// ResolveTask settles a pending task — the human-in-the-loop decision. token is
+// the task's ResolutionToken (the bearer credential from the session log);
+// decision is DecisionApproved or DecisionDenied; actor and reason are recorded
+// on the resolution for the audit trail. On success the runtime resumes the
+// process that was parked on the task.
+func (c *AuroraClient) ResolveTask(ctx context.Context, taskID, token, decision, actor, reason string) (Task, error) {
+	body := map[string]any{
+		"resolution_token": token,
+		"resolution": map[string]any{
+			"decision": decision,
+			"actor":    actor,
+			"reason":   reason,
+		},
+	}
+	var out Task
+	err := c.do(ctx, http.MethodPost, "/v1/tasks/"+taskID+"/resolve", body, &out)
 	return out, err
 }
 

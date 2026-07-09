@@ -10,13 +10,21 @@ history — the bot remembers what it already found.
 
 Its purpose, for now, is a duty bot that **gathers information to help a human
 mitigate an incident**: ask it a question, watch it pull from the internet,
-memory, and its own reasoning, and get a written answer in the thread.
+memory, and its own reasoning, and get a written answer in the thread. When it
+wants to take a sensitive action, it **asks first** — a human approves or denies
+right in the thread (see [Human-in-the-loop](#human-in-the-loop)).
 
 ```
-Slack channel ──HTTP events──▶ aurora-slack-connector ──localhost /v1──▶ aurora-dist
-     ▲                                    │
-     └──────── chat.postMessage / update ─┘   (progress + answer, in-thread)
+Slack events ──▶ ┌───────────────────────┐ ──localhost /v1──▶ aurora-dist
+Slack actions ─▶ │ aurora-slack-connector │ ◀── poll: journal, tasks
+     ▲           └───────────────────────┘
+     └──── chat.postMessage / update / Approve·Deny buttons (in-thread) ──┘
 ```
+
+The connector is a standalone HTTP server that **integrates with aurora-dist's
+existing HTTP API over localhost** — it does not embed or vendor the runtime.
+aurora-dist runs as its own process on the same machine; the connector is a
+pure client of its `/v1` API (the module has zero non-stdlib dependencies).
 
 ## How it maps onto aurora
 
@@ -30,6 +38,7 @@ Slack threads to aurora sessions.
 | a message in that thread | a **process** (`POST /v1/sessions/{id}/processes`) | the message text is the process input |
 | the bot's reply | the process's answer, polled to completion | posted back into the thread |
 | "what is it doing?" | the process **journal** (`GET /v1/sessions/{id}`) | each `syscall.name` narrated as a status line |
+| an approval prompt | a pending **task** (`…/tasks[]`) resolved via `POST /v1/tasks/{id}/resolve` | Approve/Deny buttons in the thread |
 
 **Shared history.** aurora seeds every new root process with its session's
 accumulated history and appends each completed process's `{input, answer}` back
@@ -48,6 +57,36 @@ keeps a single status message updated with the syscall timeline — e.g.
 `🧠 thinking`, `🌐 querying the internet …` (the `…` marks the syscall in
 flight right now) — then posts the final answer as a new message.
 
+## Human-in-the-loop
+
+When a manifest grants a capability with `require_approval: true`, the agent
+cannot use it unilaterally: aurora creates a pending **task** and parks the
+process in `waiting_for_task` until a human decides. The connector turns that
+into an in-thread prompt:
+
+1. On seeing a pending approval task, it posts a Block Kit message —
+   `🔐 Approval needed — the duty bot wants to …`, with the syscall and its
+   arguments — and **Approve** / **Deny** buttons. The status line switches to
+   `⏸️ waiting for your approval`, and the process's timeout is held open while
+   a human thinks.
+2. A click hits the connector's interactivity endpoint (`/slack/interactions`),
+   whose signature is verified like any Slack request. The connector re-reads
+   the task from the session log — for its current state and its
+   `resolution_token` — and calls `POST /v1/tasks/{id}/resolve` with the
+   decision and the clicking user as the `actor` (recorded on the resolution
+   for the audit trail).
+3. aurora resumes the parked process; the poll loop carries on to the answer.
+   The prompt is rewritten to `✅ Approved by @you` / `🚫 Denied by @you` and its
+   buttons removed, so it can't be actioned twice.
+
+Notes:
+- The **resolution token never travels through Slack** — only the (non-secret)
+  task and session ids ride in the button; the token is fetched from aurora at
+  click time. This also means the flow survives a connector restart.
+- Timer parks (`sys.timer`) are *not* prompted — the runtime's timer actor
+  resolves those itself; only genuine human-approval tasks raise a prompt.
+- Any member of the channel can approve or deny; the decider is recorded.
+
 ## Slack app setup
 
 Create a Slack app (from scratch) for your workspace and configure:
@@ -60,13 +99,17 @@ Create a Slack app (from scratch) for your workspace and configure:
    `app_mention` and `message.channels` (or `message.groups` for a private
    channel). Slack will call the URL once to verify it — the connector answers
    the handshake automatically.
-3. **Signing secret**: copy it from *Basic Information* → *App Credentials*. The
-   connector verifies every request against it.
-4. Invite the bot to the one channel it should serve and note that channel's ID
+3. **Interactivity & Shortcuts**: enable it and set the Request URL to
+   `https://<your-host>/slack/interactions`. This is what delivers the
+   Approve/Deny button clicks for human-in-the-loop approvals.
+4. **Signing secret**: copy it from *Basic Information* → *App Credentials*. The
+   connector verifies every request (events and interactions) against it.
+5. Invite the bot to the one channel it should serve and note that channel's ID
    (`C…`).
 
 The Events API delivers over HTTP, so the connector must be reachable by Slack
-at a public HTTPS URL (put it behind your ingress / a tunnel in dev).
+at a public HTTPS URL (put it behind your ingress / a tunnel in dev). Both the
+events and interactions Request URLs point at the same server.
 
 ## Configuration
 
@@ -86,6 +129,7 @@ capability grants live in the aurora manifest you supply.
 | `SLACK_API_BASE_URL` | | `https://slack.com/api` | Override for an enterprise gateway or testing |
 | `ADDR` | | `:3000` | Listen address |
 | `EVENTS_PATH` | | `/slack/events` | Path Slack posts events to |
+| `INTERACTIONS_PATH` | | `/slack/interactions` | Path Slack posts button clicks to (must differ from `EVENTS_PATH`) |
 | `POLL_INTERVAL` | | `2s` | How often a running process is polled |
 | `PROCESS_TIMEOUT` | | `15m` | How long to actively report on one process before backing off |
 | `HTTP_TIMEOUT` | | `30s` | Per-request timeout for aurora/Slack calls |
@@ -123,9 +167,11 @@ and key. A starting point for an information-gathering duty bot:
 ```
 
 Notes:
-- Keep the duty bot **read-only** for now: no approvals to resolve
-  (`require_approval: false`) means it never parks waiting on a human decision
-  the connector can't yet relay.
+- Set `require_approval: true` on any capability whose use should need a human
+  sign-off (e.g. a `POST` to an internal endpoint). aurora will park the process
+  and the connector will raise an Approve/Deny prompt in the thread — see
+  [Human-in-the-loop](#human-in-the-loop). Read-only lookups can stay
+  `require_approval: false` so investigation flows without interruption.
 - Add `sys.spawn` if you want the agent to delegate sub-investigations; its
   child processes inherit the session history by default (`history: true`).
 - The manifest must not grant beyond aurora-dist's configured capability
@@ -164,15 +210,18 @@ go build ./...
 The tests stub both aurora-dist and the Slack Web API with `httptest` servers
 and drive the connector end to end (session creation, process spawn, journal
 polling, progress updates, dedup of duplicate deliveries, signature
-verification, and thread → session reattachment).
+verification, thread → session reattachment, and the full approval flow —
+prompt → signed button click → task resolution → answer).
 
 ## Scope and limitations
 
 - **One channel, one connector.** By design.
-- **Events API only.** The connector receives over HTTP; it needs a public URL.
-- **No task resolution yet.** Approvals and other durable tasks that need a
-  human decision aren't surfaced to Slack — run the duty bot with
-  `require_approval: false`. Timers resolve themselves and are polled through.
+- **Events API only.** The connector receives over HTTP; it needs a public URL
+  (for both the events and interactions Request URLs).
+- **Approvals are approve/deny.** Human-in-the-loop covers the common case — a
+  gated syscall a human approves or denies. Richer resolutions aurora supports
+  (e.g. `completed` with substituted data) aren't exposed as buttons. Timer
+  parks resolve themselves and are polled through, never prompted.
 - **In-memory dedup and worker registry.** These are rebuilt on restart; the
-  durable thread → session mapping (the session name) is what preserves
-  continuity across restarts.
+  durable thread → session mapping (the session name) and the tasks' aurora-side
+  state are what preserve continuity across restarts.
