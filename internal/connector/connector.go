@@ -67,9 +67,13 @@ func New(cfg Config, aurora *AuroraClient, slack *SlackClient, logger *slog.Logg
 		slack:     slack,
 		botUserID: cfg.BotUserID,
 		logger:    logger,
-		threads:   make(map[string]*thread),
-		seen:      newSeenSet(seenCapacity),
-		mentionRE: regexp.MustCompile(`<@[A-Z0-9]+>`),
+		// Background until Start installs the cancellable context, so an event
+		// that somehow arrives before Start never dereferences a nil context.
+		ctx:     context.Background(),
+		threads: make(map[string]*thread),
+		seen:    newSeenSet(seenCapacity),
+		// A Slack user mention: "<@U123>" or the labelled form "<@U123|name>".
+		mentionRE: regexp.MustCompile(`<@[A-Z0-9]+(?:\|[^>]*)?>`),
 	}
 }
 
@@ -387,10 +391,13 @@ func (c *Connector) pollProcess(ctx context.Context, t *thread, processID, statu
 		if err != nil {
 			c.logger.Warn("poll process", "process", processID, "error", err)
 		} else {
-			// Refresh the log when the journal grows, the process ends, or it is
-			// parked on a task (so a newly-created approval is seen promptly even
-			// though it did not change the journal length).
-			if snap.JournalLength != lastJournalLen || IsTerminal(snap.Status) || snap.Status == StatusWaitingTask {
+			// Refresh the log when the journal grows or the process ends. Parking
+			// on a task (approval or timer) always appends its syscall's journal
+			// entry, and aurora reports the parked status only once that entry —
+			// and the task — are committed, so a journal-length change catches a
+			// new approval without polling the whole log every tick during a wait.
+			// The first poll always refreshes (lastJournalLen starts at -1).
+			if snap.JournalLength != lastJournalLen || IsTerminal(snap.Status) {
 				if log, lerr := c.aurora.GetSessionLog(ctx, t.sessionID); lerr != nil {
 					c.logger.Warn("fetch session log", "session", t.sessionID, "error", lerr)
 				} else if pl := log.Process(processID); pl != nil {
@@ -485,10 +492,12 @@ func (c *Connector) report(ctx context.Context, t *thread, statusTS, text string
 
 // --- text helpers ---
 
-// cleanText strips bot mentions and a leading trigger keyword, then trims — the
-// bytes that reach aurora are the human's actual request.
+// cleanText strips bot mentions and a leading trigger keyword — the bytes that
+// reach aurora are the human's actual request. Horizontal whitespace within a
+// line is collapsed, but line breaks are preserved so a pasted log or stack
+// trace keeps its structure.
 func (c *Connector) cleanText(text string) string {
-	text = collapseSpaces(c.mentionRE.ReplaceAllString(text, " "))
+	text = normalizeInput(c.mentionRE.ReplaceAllString(text, " "))
 	if kw := c.cfg.TriggerKeyword; kw != "" && strings.HasPrefix(strings.ToLower(text), strings.ToLower(kw)) {
 		text = strings.TrimSpace(text[len(kw):])
 	}
@@ -534,17 +543,35 @@ func resetTimer(t *time.Timer, d time.Duration) {
 	t.Reset(d)
 }
 
+// collapseSpaces flattens every run of whitespace (including newlines) to a
+// single space — for single-line renderings like error details.
 func collapseSpaces(s string) string {
 	return strings.Join(strings.Fields(s), " ")
 }
 
+// normalizeInput collapses horizontal whitespace within each line but keeps the
+// line breaks, then trims — so multi-line input reaches aurora intact.
+func normalizeInput(s string) string {
+	lines := strings.Split(s, "\n")
+	for i, line := range lines {
+		lines[i] = strings.Join(strings.Fields(line), " ")
+	}
+	return strings.TrimSpace(strings.Join(lines, "\n"))
+}
+
+// truncate bounds a string to max runes (not bytes, so it never splits a
+// multi-byte rune), appending an ellipsis when it cuts.
+func truncate(s string, max int) string {
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max]) + "…"
+}
+
 // oneLine flattens and bounds an error/detail string for a chat line.
 func oneLine(s string) string {
-	s = collapseSpaces(s)
-	const max = 500
-	if len(s) > max {
-		s = s[:max] + "…"
-	}
+	s = truncate(collapseSpaces(s), 500)
 	if s == "" {
 		return "(no detail)"
 	}

@@ -100,17 +100,14 @@ func button(actionID, label, style, value string) map[string]any {
 
 // argsSnippet renders a bounded, single-line view of a syscall's args for the
 // prompt (the decision-relevant content of an approval — the URL being fetched,
-// the value being written).
+// the value being written). Backticks are dropped so the guest's args can't
+// break out of the surrounding mrkdwn code span.
 func argsSnippet(raw json.RawMessage) string {
-	s := collapseSpaces(string(raw))
+	s := strings.ReplaceAll(collapseSpaces(string(raw)), "`", "'")
 	if s == "" || s == "null" {
 		return ""
 	}
-	const max = 300
-	if len(s) > max {
-		s = s[:max] + "…"
-	}
-	return s
+	return truncate(s, 300)
 }
 
 // --- interactions endpoint ---

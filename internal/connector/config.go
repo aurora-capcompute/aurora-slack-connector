@@ -98,6 +98,9 @@ func LoadConfig() (Config, error) {
 	if cfg.InteractionsPath == "" {
 		cfg.InteractionsPath = "/slack/interactions"
 	}
+	// A leading slash is required by the HTTP mux pattern; tolerate it missing.
+	cfg.EventsPath = ensureLeadingSlash(cfg.EventsPath)
+	cfg.InteractionsPath = ensureLeadingSlash(cfg.InteractionsPath)
 	if cfg.TriggerKeyword == "" {
 		cfg.TriggerKeyword = "@duty"
 	}
@@ -151,6 +154,13 @@ func loadManifest() (json.RawMessage, error) {
 		return nil, fmt.Errorf("canonicalize manifest: %w", err)
 	}
 	return compact, nil
+}
+
+func ensureLeadingSlash(p string) string {
+	if p == "" || strings.HasPrefix(p, "/") {
+		return p
+	}
+	return "/" + p
 }
 
 func durationEnv(key string, def time.Duration) (time.Duration, error) {
