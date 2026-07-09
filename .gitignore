@@ -1,0 +1,4 @@
+/aurora-slack-connector
+/connector
+*.test
+*.out
