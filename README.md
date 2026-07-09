@@ -109,7 +109,7 @@ starting point for an information‑gathering duty bot:
   "version": 4,
   "syscalls": [
     {"syscall": "core.openaiApi", "hidden": true,
-     "base_url": "https://api.openai.com/v1", "api_key": "sk-...",
+     "base_url": "https://api.openai.com/v1", "api_key": {"secret": "OPENAI_KEY"},
      "default_model": "gpt-4o",
      "capabilities": [{"operation": "chat", "require_approval": false}]},
     {"syscall": "core.internet",
@@ -119,6 +119,14 @@ starting point for an information‑gathering duty bot:
     {"syscall": "sys.timer"}
   ]
 }
+```
+
+The `api_key` is a **secret reference** — the connector forwards the manifest to
+aurora-dist verbatim, and aurora-dist resolves the value from its own environment, so
+the key never sits in this file. Set it where aurora-dist runs:
+
+```sh
+export AURORA_SECRET_OPENAI_KEY=sk-...   # on the aurora-dist process, not the connector
 ```
 
 Set `require_approval: true` on any capability that should need human sign‑off — the
