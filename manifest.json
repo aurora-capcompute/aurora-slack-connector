@@ -1,0 +1,45 @@
+{
+    "display_information": {
+        "name": "aurora-bot",
+        "description": "This is a bot that has to reduce the burden of duty support.",
+        "background_color": "#255915",
+        "long_description": "This bot helps people on duty to solve customer's problems. It is internal and for starters will try to help ik8s-net duty to gather data that could save engineer quite some time."
+    },
+    "features": {
+        "bot_user": {
+            "display_name": "aurora-bot",
+            "always_online": false
+        }
+    },
+    "oauth_config": {
+        "scopes": {
+            "bot": [
+                "chat:write",
+                "channels:history",
+                "groups:history",
+                "app_mentions:read",
+                "reactions:read",
+                "reactions:write"
+            ]
+        },
+        "pkce_enabled": false
+    },
+    "settings": {
+        "event_subscriptions": {
+            "bot_events": [
+                "app_mention",
+                "message.channels",
+                "message.groups",
+                "reaction_added",
+                "reaction_removed"
+            ]
+        },
+        "interactivity": {
+            "is_enabled": true
+        },
+        "org_deploy_enabled": false,
+        "socket_mode_enabled": true,
+        "token_rotation_enabled": false,
+        "is_mcp_enabled": false
+    }
+}

@@ -53,12 +53,18 @@ func main() {
 	conn := connector.New(cfg, aurora, slack, logger)
 	conn.Start(ctx)
 
+	// A small HTTP server for liveness only — Socket Mode is an outbound
+	// WebSocket, so there is no inbound events endpoint to serve.
 	srv := &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           conn.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("health server", "error", err)
+		}
+	}()
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -66,11 +72,8 @@ func main() {
 		_ = srv.Shutdown(shutdownCtx)
 	}()
 
-	logger.Info("aurora-slack-connector listening",
-		"addr", cfg.Addr, "events_path", cfg.EventsPath, "channel", cfg.ChannelID, "aurora", cfg.AuroraBaseURL)
-	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		logger.Error("http server", "error", err)
-		os.Exit(1)
-	}
+	logger.Info("aurora-slack-connector connecting (socket mode)",
+		"channel", cfg.ChannelID, "aurora", cfg.AuroraBaseURL, "health_addr", cfg.Addr)
+	conn.Run(ctx) // blocks until the context is cancelled
 	logger.Info("shut down cleanly")
 }

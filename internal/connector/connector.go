@@ -3,13 +3,20 @@ package connector
 import (
 	"context"
 	"encoding/json"
-	"io"
 	"log/slog"
 	"net/http"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
+)
+
+// Reaction emoji the bot uses to acknowledge a message it is working on: eyes
+// while it runs, then a check on success or a cross on any non-success terminal.
+const (
+	reactionWorking = "eyes"
+	reactionDone    = "white_check_mark"
+	reactionFailed  = "x"
 )
 
 const (
@@ -24,12 +31,12 @@ const (
 	idleTimeout = 30 * time.Minute
 )
 
-// Connector wires Slack to a local aurora-dist. It receives Slack events over
-// HTTP, maps each thread to an aurora session, and runs each user message as a
-// process (an "aurora spawn") in that session — serialized per thread so the
-// session's single-active-process rule holds and history is shared across
-// messages. While a process runs it polls aurora and narrates the syscalls back
-// into the thread.
+// Connector wires Slack to a local aurora-dist. It receives Slack events over a
+// Socket Mode WebSocket, maps each thread to an aurora session, and runs each
+// user message as a process (an "aurora spawn") in that session — serialized per
+// thread so the session's single-active-process rule holds and history is shared
+// across messages. While a process runs it polls aurora and narrates the
+// syscalls back into the thread.
 type Connector struct {
 	cfg       Config
 	aurora    *AuroraClient
@@ -53,7 +60,15 @@ type Connector struct {
 type thread struct {
 	threadTS  string
 	sessionID string
-	inbox     chan string
+	inbox     chan inboundMsg
+}
+
+// inboundMsg is one message routed to a thread worker: the cleaned text that
+// becomes the aurora process input, plus the ts of the originating Slack message
+// so the worker can acknowledge it with reactions (👀 → ✅/❌).
+type inboundMsg struct {
+	text      string
+	messageTS string
 }
 
 // New builds a Connector from config and its two clients.
@@ -91,16 +106,19 @@ func (c *Connector) Start(ctx context.Context) {
 	}
 }
 
-// Handler returns the connector's HTTP mux: the Slack events endpoint plus a
-// health check.
+// Run opens the Socket Mode connection and delivers events and interactions into
+// the connector until ctx is cancelled. Start must have been called first (it
+// records the base context and resolves the bot identity).
+func (c *Connector) Run(ctx context.Context) {
+	sm := NewSocketMode(c.cfg.SlackAppToken, c.cfg.HTTPTimeout, c.logger, c.handleEventPayload, c.handleInteractionPayload)
+	sm.SetAPIBaseURL(c.cfg.SlackAPIBaseURL)
+	sm.Run(ctx)
+}
+
+// Handler returns the connector's HTTP mux — a health check only. Events arrive
+// over the outbound Socket Mode connection (see Run), not an inbound endpoint.
 func (c *Connector) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST "+c.cfg.EventsPath, c.handleEvents)
-	if p := c.cfg.InteractionsPath; p != "" && p != c.cfg.EventsPath {
-		// Interactive Approve/Deny button clicks land here (Slack's
-		// Interactivity request URL) — the human-in-the-loop path.
-		mux.HandleFunc("POST "+p, c.handleInteractions)
-	}
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
@@ -111,10 +129,9 @@ func (c *Connector) Handler() http.Handler {
 // --- Slack event ingestion ---
 
 type slackEnvelope struct {
-	Type      string     `json:"type"`
-	Challenge string     `json:"challenge"`
-	EventID   string     `json:"event_id"`
-	Event     slackEvent `json:"event"`
+	Type    string     `json:"type"`
+	EventID string     `json:"event_id"`
+	Event   slackEvent `json:"event"`
 }
 
 type slackEvent struct {
@@ -126,36 +143,32 @@ type slackEvent struct {
 	TS       string `json:"ts"`
 	ThreadTS string `json:"thread_ts"`
 	Channel  string `json:"channel"`
+	// Reaction events (reaction_added / reaction_removed).
+	Reaction string       `json:"reaction"`
+	Item     reactionItem `json:"item"`
 }
 
-func (c *Connector) handleEvents(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes))
-	if err != nil {
-		http.Error(w, "read error", http.StatusBadRequest)
-		return
-	}
-	if err := VerifySlackSignature(c.cfg.SlackSigningSecret, r.Header, body, time.Now()); err != nil {
-		c.logger.Warn("rejected slack request", "error", err)
-		http.Error(w, "invalid signature", http.StatusUnauthorized)
-		return
-	}
+// reactionItem is the target of a reaction event — the message it was added to.
+type reactionItem struct {
+	Type    string `json:"type"`
+	Channel string `json:"channel"`
+	TS      string `json:"ts"`
+}
+
+// handleEventPayload receives one Socket Mode events_api payload (the standard
+// Events API body) and routes it. The Socket Mode loop has already acknowledged
+// the envelope, so the actual work runs on its own goroutine — a slow aurora
+// call must not stall the socket reader.
+func (c *Connector) handleEventPayload(payload []byte) {
 	var env slackEnvelope
-	if err := json.Unmarshal(body, &env); err != nil {
-		http.Error(w, "bad json", http.StatusBadRequest)
+	if err := json.Unmarshal(payload, &env); err != nil {
+		c.logger.Warn("decode event payload", "error", err)
 		return
 	}
-	// The one-time endpoint verification handshake echoes the challenge.
-	if env.Type == "url_verification" {
-		w.Header().Set("Content-Type", "text/plain")
-		_, _ = w.Write([]byte(env.Challenge))
+	if env.Type != "event_callback" {
 		return
 	}
-	// Ack fast (Slack demands a 200 within 3s) and do the work asynchronously —
-	// the downstream aurora calls must not hold the response open.
-	w.WriteHeader(http.StatusOK)
-	if env.Type == "event_callback" {
-		go c.dispatchEvent(env)
-	}
+	go c.dispatchEvent(env)
 }
 
 // dispatchEvent filters an inbound event to the messages this duty bot acts on
@@ -163,7 +176,17 @@ func (c *Connector) handleEvents(w http.ResponseWriter, r *http.Request) {
 func (c *Connector) dispatchEvent(env slackEnvelope) {
 	ev := env.Event
 
-	// Only the two event kinds we subscribe to.
+	// A trigger reaction on a message starts an investigation of that message.
+	if ev.Type == "reaction_added" {
+		c.handleReaction(ev)
+		return
+	}
+	// reaction_removed is subscribed for completeness but drives no behavior.
+	if ev.Type == "reaction_removed" {
+		return
+	}
+
+	// Otherwise, only the two message event kinds we act on.
 	if ev.Type != "app_mention" && ev.Type != "message" {
 		return
 	}
@@ -208,18 +231,64 @@ func (c *Connector) dispatchEvent(env slackEnvelope) {
 	// our own user id.
 	trigger := c.mentionsBot(ev.Text) || c.hasTrigger(ev.Text) ||
 		(c.botUserID == "" && ev.Type == "app_mention")
-	c.deliver(threadTS, text, trigger, isReply)
+	c.deliver(threadTS, text, ev.TS, trigger, isReply)
+}
+
+// handleReaction starts an investigation when the configured trigger emoji is
+// added to a channel message: it reads that message and runs its text as a duty
+// process in a thread rooted at it. A reaction on a message the bot can't read
+// (a thread reply, since conversations.history returns only top-level messages)
+// or on a bot/system message is ignored.
+func (c *Connector) handleReaction(ev slackEvent) {
+	if c.cfg.TriggerReaction == "" || ev.Reaction != c.cfg.TriggerReaction {
+		return
+	}
+	if ev.Item.Type != "message" || ev.Item.Channel != c.cfg.ChannelID {
+		return
+	}
+	if c.botUserID != "" && ev.User == c.botUserID {
+		return // the bot's own acknowledgement reaction, not a human trigger
+	}
+	// Only the first trigger reaction on a message starts an investigation;
+	// further reactions (by anyone) on the same message are no-ops.
+	if !c.seen.add("react:" + ev.Item.Channel + ":" + ev.Item.TS) {
+		return
+	}
+	msg, found, err := c.slack.GetMessage(c.ctx, ev.Item.Channel, ev.Item.TS)
+	if err != nil {
+		c.logger.Warn("reaction: fetch message", "ts", ev.Item.TS, "error", err)
+		return
+	}
+	if !found {
+		c.logger.Info("reaction trigger on an unreadable message (e.g. a thread reply); skipping", "ts", ev.Item.TS)
+		return
+	}
+	if msg.BotID != "" || msg.Subtype != "" || (c.botUserID != "" && msg.User == c.botUserID) {
+		return // don't investigate bot or non-plain messages
+	}
+	text := c.cleanText(msg.Text)
+	if text == "" {
+		return
+	}
+	// Root the investigation thread at the reacted message; acknowledge that
+	// same message (item ts) with the working/done reactions.
+	threadTS := msg.TS
+	if msg.ThreadTS != "" {
+		threadTS = msg.ThreadTS
+	}
+	c.deliver(threadTS, text, msg.TS, true, threadTS != msg.TS)
 }
 
 // deliver routes a cleaned message to the right thread worker, (re)attaching the
 // aurora session as needed. A trigger (a mention or the configured keyword)
 // starts a new duty thread; a plain message is served only if the thread is
 // already ours (an active worker, or an existing session by name).
-func (c *Connector) deliver(threadTS, text string, trigger, isReply bool) {
+func (c *Connector) deliver(threadTS, text, messageTS string, trigger, isReply bool) {
+	msg := inboundMsg{text: text, messageTS: messageTS}
 	// Fast path: a live worker already serves this thread.
 	c.mu.Lock()
 	if t, ok := c.threads[threadTS]; ok {
-		t.submit(text, c.logger)
+		t.submit(msg, c.logger)
 		c.mu.Unlock()
 		return
 	}
@@ -240,7 +309,7 @@ func (c *Connector) deliver(threadTS, text string, trigger, isReply bool) {
 		if sessionID == "" {
 			return
 		}
-		c.startWorker(threadTS, sessionID, text)
+		c.startWorker(threadTS, sessionID, msg)
 		return
 	}
 
@@ -258,21 +327,21 @@ func (c *Connector) deliver(threadTS, text string, trigger, isReply bool) {
 		}
 		return
 	}
-	c.startWorker(threadTS, sessionID, text)
+	c.startWorker(threadTS, sessionID, msg)
 }
 
 // startWorker registers a thread and launches its worker, or hands the message
 // to an existing worker if one raced into place.
-func (c *Connector) startWorker(threadTS, sessionID, firstText string) {
+func (c *Connector) startWorker(threadTS, sessionID string, first inboundMsg) {
 	c.mu.Lock()
 	if t, ok := c.threads[threadTS]; ok {
-		t.submit(firstText, c.logger)
+		t.submit(first, c.logger)
 		c.mu.Unlock()
 		return
 	}
-	t := &thread{threadTS: threadTS, sessionID: sessionID, inbox: make(chan string, inboxBuffer)}
+	t := &thread{threadTS: threadTS, sessionID: sessionID, inbox: make(chan inboundMsg, inboxBuffer)}
 	c.threads[threadTS] = t
-	t.submit(firstText, c.logger)
+	t.submit(first, c.logger)
 	c.mu.Unlock()
 
 	c.logger.Info("serving thread", "thread", threadTS, "session", sessionID)
@@ -281,9 +350,9 @@ func (c *Connector) startWorker(threadTS, sessionID, firstText string) {
 
 // submit enqueues a message for the worker without blocking the caller; a full
 // mailbox drops the message with a warning rather than stalling event handling.
-func (t *thread) submit(text string, logger *slog.Logger) {
+func (t *thread) submit(msg inboundMsg, logger *slog.Logger) {
 	select {
-	case t.inbox <- text:
+	case t.inbox <- msg:
 	default:
 		logger.Warn("thread inbox full; dropping message", "thread", t.threadTS)
 	}
@@ -297,9 +366,9 @@ func (c *Connector) runThread(t *thread) {
 	defer idle.Stop()
 	for {
 		select {
-		case text := <-t.inbox:
+		case msg := <-t.inbox:
 			resetTimer(idle, idleTimeout)
-			c.handleMessage(c.ctx, t, text)
+			c.handleMessage(c.ctx, t, msg)
 		case <-idle.C:
 			// Retire only when nothing is queued, under the lock so a concurrent
 			// submit cannot be lost to a dead worker.
@@ -324,19 +393,49 @@ func (c *Connector) runThread(t *thread) {
 // handleMessage runs a single user message as a process and reports its progress
 // back into the thread. It blocks the worker until the process finishes, which
 // is exactly the per-thread serialization we want.
-func (c *Connector) handleMessage(ctx context.Context, t *thread, text string) {
+func (c *Connector) handleMessage(ctx context.Context, t *thread, msg inboundMsg) {
+	c.ackWorking(ctx, msg.messageTS)
+
 	statusTS, err := c.slack.PostMessage(ctx, c.cfg.ChannelID, t.threadTS, statusHeader(StatusQueued, false))
 	if err != nil {
 		c.logger.Warn("post status message", "thread", t.threadTS, "error", err)
 		// Without a status message we can still run; progress just won't render.
 	}
 
-	proc, err := c.spawn(ctx, t.sessionID, text)
+	proc, err := c.spawn(ctx, t.sessionID, msg.text)
 	if err != nil {
 		c.report(ctx, t, statusTS, "❌ I couldn't start the investigation: "+oneLine(err.Error()))
+		c.ackDone(ctx, msg.messageTS, StatusFailed)
 		return
 	}
-	c.pollProcess(ctx, t, proc.ID, statusTS)
+	c.pollProcess(ctx, t, proc.ID, statusTS, msg.messageTS)
+}
+
+// ackWorking marks a message the bot has started on with the working reaction.
+// Best effort — a failed reaction never blocks the investigation.
+func (c *Connector) ackWorking(ctx context.Context, messageTS string) {
+	if messageTS == "" {
+		return
+	}
+	if err := c.slack.AddReaction(ctx, c.cfg.ChannelID, messageTS, reactionWorking); err != nil {
+		c.logger.Warn("add working reaction", "ts", messageTS, "error", err)
+	}
+}
+
+// ackDone swaps the working reaction for a terminal one: a check on success, a
+// cross otherwise. Best effort.
+func (c *Connector) ackDone(ctx context.Context, messageTS, status string) {
+	if messageTS == "" {
+		return
+	}
+	_ = c.slack.RemoveReaction(ctx, c.cfg.ChannelID, messageTS, reactionWorking)
+	emoji := reactionFailed
+	if status == StatusCompleted {
+		emoji = reactionDone
+	}
+	if err := c.slack.AddReaction(ctx, c.cfg.ChannelID, messageTS, emoji); err != nil {
+		c.logger.Warn("add done reaction", "ts", messageTS, "error", err)
+	}
 }
 
 // spawn creates the process, tolerating a transient "session already has an
@@ -388,7 +487,7 @@ func (c *Connector) waitSessionIdle(ctx context.Context, sessionID string, deadl
 // fetched when the journal grows, the process is parked on a task, or it ends —
 // both to render the syscall timeline and to surface human-in-the-loop
 // approvals. On a terminal status it posts the final answer or error.
-func (c *Connector) pollProcess(ctx context.Context, t *thread, processID, statusTS string) {
+func (c *Connector) pollProcess(ctx context.Context, t *thread, processID, statusTS, messageTS string) {
 	deadline := time.Now().Add(c.cfg.ProcessTimeout)
 	ticker := time.NewTicker(c.cfg.PollInterval)
 	defer ticker.Stop()
@@ -448,6 +547,7 @@ func (c *Connector) pollProcess(ctx context.Context, t *thread, processID, statu
 			}
 			if IsTerminal(snap.Status) {
 				c.postOutcome(ctx, t, snap)
+				c.ackDone(ctx, messageTS, snap.Status)
 				return
 			}
 		}

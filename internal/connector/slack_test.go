@@ -2,55 +2,13 @@ package connector
 
 import (
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"strconv"
 	"testing"
 	"time"
 )
-
-// signSlack produces the headers Slack would send for a body, for tests and for
-// the handler test below.
-func signSlack(secret, body string, ts time.Time) http.Header {
-	mac := hmac.New(sha256.New, []byte(secret))
-	mac.Write([]byte("v0:" + strconv.FormatInt(ts.Unix(), 10) + ":" + body))
-	h := http.Header{}
-	h.Set("X-Slack-Request-Timestamp", strconv.FormatInt(ts.Unix(), 10))
-	h.Set("X-Slack-Signature", "v0="+hex.EncodeToString(mac.Sum(nil)))
-	return h
-}
-
-func TestVerifySlackSignature(t *testing.T) {
-	secret := "s3cr3t"
-	body := `{"type":"event_callback"}`
-	now := time.Unix(1_700_000_000, 0)
-
-	if err := VerifySlackSignature(secret, signSlack(secret, body, now), []byte(body), now); err != nil {
-		t.Fatalf("valid signature rejected: %v", err)
-	}
-	// Wrong secret.
-	if err := VerifySlackSignature(secret, signSlack("other", body, now), []byte(body), now); err == nil {
-		t.Fatal("signature under wrong secret accepted")
-	}
-	// Tampered body.
-	if err := VerifySlackSignature(secret, signSlack(secret, body, now), []byte(body+"x"), now); err == nil {
-		t.Fatal("tampered body accepted")
-	}
-	// Stale timestamp (10 minutes old).
-	stale := signSlack(secret, body, now.Add(-10*time.Minute))
-	if err := VerifySlackSignature(secret, stale, []byte(body), now); err == nil {
-		t.Fatal("stale timestamp accepted")
-	}
-	// Missing headers.
-	if err := VerifySlackSignature(secret, http.Header{}, []byte(body), now); err == nil {
-		t.Fatal("missing headers accepted")
-	}
-}
 
 func TestSlackClientCalls(t *testing.T) {
 	var gotAuth, gotPost, gotUpdate bool
@@ -113,5 +71,100 @@ func TestSlackClientErrorResponse(t *testing.T) {
 	c.baseURL = srv.URL
 	if _, err := c.PostMessage(context.Background(), "C1", "T1", "hi"); err == nil {
 		t.Fatal("expected error from ok:false response")
+	}
+}
+
+func TestSlackClientReactions(t *testing.T) {
+	var addBody, removeBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var in map[string]any
+		_ = json.Unmarshal(body, &in)
+		switch r.URL.Path {
+		case "/reactions.add":
+			addBody = in
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		case "/reactions.remove":
+			removeBody = in
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	c := NewSlackClient("xoxb-test", time.Second)
+	c.baseURL = srv.URL
+	ctx := context.Background()
+
+	if err := c.AddReaction(ctx, "C1", "100.1", "eyes"); err != nil {
+		t.Fatalf("add reaction: %v", err)
+	}
+	if addBody["channel"] != "C1" || addBody["timestamp"] != "100.1" || addBody["name"] != "eyes" {
+		t.Fatalf("reactions.add body = %v", addBody)
+	}
+	if err := c.RemoveReaction(ctx, "C1", "100.1", "eyes"); err != nil {
+		t.Fatalf("remove reaction: %v", err)
+	}
+	if removeBody["name"] != "eyes" {
+		t.Fatalf("reactions.remove body = %v", removeBody)
+	}
+}
+
+// An already-present reaction (add) or an absent one (remove) is not an error —
+// reaction acknowledgements are idempotent.
+func TestSlackClientReactionsIdempotent(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/reactions.add" {
+			_, _ = w.Write([]byte(`{"ok":false,"error":"already_reacted"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"ok":false,"error":"no_reaction"}`))
+	}))
+	defer srv.Close()
+	c := NewSlackClient("xoxb-test", time.Second)
+	c.baseURL = srv.URL
+	ctx := context.Background()
+	if err := c.AddReaction(ctx, "C1", "1.1", "eyes"); err != nil {
+		t.Fatalf("already_reacted should be tolerated: %v", err)
+	}
+	if err := c.RemoveReaction(ctx, "C1", "1.1", "eyes"); err != nil {
+		t.Fatalf("no_reaction should be tolerated: %v", err)
+	}
+}
+
+func TestSlackClientGetMessage(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/conversations.history" {
+			http.NotFound(w, r)
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		var in map[string]any
+		_ = json.Unmarshal(body, &in)
+		if in["inclusive"] != true {
+			t.Errorf("history should request an inclusive single-message window: %v", in)
+		}
+		// Only the exact-ts window returns the message; any other ts returns none.
+		if in["latest"] == "42.1" {
+			_, _ = w.Write([]byte(`{"ok":true,"messages":[{"type":"message","user":"U1","text":"hello","ts":"42.1"}]}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"ok":true,"messages":[]}`))
+	}))
+	defer srv.Close()
+	c := NewSlackClient("xoxb-test", time.Second)
+	c.baseURL = srv.URL
+
+	msg, found, err := c.GetMessage(context.Background(), "C1", "42.1")
+	if err != nil || !found {
+		t.Fatalf("get message: found=%v err=%v", found, err)
+	}
+	if msg.Text != "hello" || msg.User != "U1" {
+		t.Fatalf("message = %+v", msg)
+	}
+
+	// A ts the history doesn't return (e.g. a thread reply) is not found.
+	if _, found, _ := c.GetMessage(context.Background(), "C1", "99.9"); found {
+		t.Fatal("a missing message should not be found")
 	}
 }

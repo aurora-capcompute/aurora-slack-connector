@@ -137,17 +137,25 @@ func (s *auroraStub) getSession(w http.ResponseWriter, r *http.Request) {
 		sessionID, active, id, status, answer, entries)
 }
 
-// slackStub records posts and updates and streams post texts on a channel.
+// slackStub records posts, updates, and reactions and streams post texts on a
+// channel. messages seeds conversations.history so a reaction trigger can read
+// the message it fired on.
 type slackStub struct {
-	server  *httptest.Server
-	mu      sync.Mutex
-	posts   int
-	updates int
-	postCh  chan string
+	server   *httptest.Server
+	mu       sync.Mutex
+	posts    int
+	updates  int
+	postCh   chan string
+	reactCh  chan string             // "add:name:ts" / "remove:name:ts"
+	messages map[string]slackMessage // ts -> message for conversations.history
 }
 
 func newSlackStub() *slackStub {
-	s := &slackStub{postCh: make(chan string, 64)}
+	s := &slackStub{
+		postCh:   make(chan string, 64),
+		reactCh:  make(chan string, 64),
+		messages: map[string]slackMessage{},
+	}
 	s.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		var in map[string]any
@@ -173,6 +181,32 @@ func newSlackStub() *slackStub {
 			s.updates++
 			s.mu.Unlock()
 			_, _ = w.Write([]byte(`{"ok":true}`))
+		case "/reactions.add", "/reactions.remove":
+			verb := "add"
+			if r.URL.Path == "/reactions.remove" {
+				verb = "remove"
+			}
+			name, _ := in["name"].(string)
+			ts, _ := in["timestamp"].(string)
+			select {
+			case s.reactCh <- verb + ":" + name + ":" + ts:
+			default:
+			}
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		case "/conversations.history":
+			latest, _ := in["latest"].(string)
+			s.mu.Lock()
+			msg, ok := s.messages[latest]
+			s.mu.Unlock()
+			if !ok {
+				_, _ = w.Write([]byte(`{"ok":true,"messages":[]}`))
+				return
+			}
+			raw, _ := json.Marshal(struct {
+				OK       bool           `json:"ok"`
+				Messages []slackMessage `json:"messages"`
+			}{OK: true, Messages: []slackMessage{msg}})
+			_, _ = w.Write(raw)
 		default:
 			http.NotFound(w, r)
 		}
@@ -182,20 +216,26 @@ func newSlackStub() *slackStub {
 
 func (s *slackStub) close() { s.server.Close() }
 
+// setMessage seeds a message conversations.history will return by its ts.
+func (s *slackStub) setMessage(m slackMessage) {
+	s.mu.Lock()
+	s.messages[m.TS] = m
+	s.mu.Unlock()
+}
+
 // newTestConnector wires a connector to the two stubs with fast polling.
 func newTestConnector(t *testing.T, a *auroraStub, sl *slackStub) *Connector {
 	t.Helper()
 	cfg := Config{
-		SlackSigningSecret: "secret",
-		ChannelID:          "C1",
-		TriggerKeyword:     "@duty",
-		EventsPath:         "/slack/events",
-		InteractionsPath:   "/slack/interactions",
-		AuroraBaseURL:      a.server.URL,
-		Manifest:           json.RawMessage(`{"version":4}`),
-		PollInterval:       5 * time.Millisecond,
-		ProcessTimeout:     5 * time.Second,
-		HTTPTimeout:        2 * time.Second,
+		SlackAppToken:   "xapp-test",
+		ChannelID:       "C1",
+		TriggerKeyword:  "@duty",
+		TriggerReaction: "eyes",
+		AuroraBaseURL:   a.server.URL,
+		Manifest:        json.RawMessage(`{"version":4}`),
+		PollInterval:    5 * time.Millisecond,
+		ProcessTimeout:  5 * time.Second,
+		HTTPTimeout:     2 * time.Second,
 	}
 	aurora := NewAuroraClient(a.server.URL, cfg.HTTPTimeout)
 	slack := NewSlackClient("xoxb-test", cfg.HTTPTimeout)
@@ -380,42 +420,123 @@ func TestConnectorDedupSameMessage(t *testing.T) {
 	}
 }
 
-func TestHandleEventsURLVerification(t *testing.T) {
+// A Socket Mode events_api payload (the standard Events API body) routes through
+// handleEventPayload to the same dispatch path an HTTP delivery used to.
+func TestHandleEventPayloadRoutesEvent(t *testing.T) {
 	a := newAuroraStub()
 	defer a.close()
 	sl := newSlackStub()
 	defer sl.close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	conn := newTestConnector(t, a, sl)
-	conn.ctx = context.Background()
+	conn.Start(ctx)
 
-	body := `{"type":"url_verification","challenge":"abc123"}`
-	req := httptest.NewRequest(http.MethodPost, "/slack/events", strings.NewReader(body))
-	for k, v := range signSlack("secret", body, time.Now()) {
-		req.Header[k] = v
+	payload := `{"type":"event_callback","event":{"type":"app_mention","user":"U1","text":"<@UBOT> ping","ts":"300.1","channel":"C1"}}`
+	conn.handleEventPayload([]byte(payload))
+	waitForPost(t, sl.postCh, "Re: ping", 3*time.Second)
+}
+
+// A trigger reaction (:eyes:) added to a channel message makes the bot read that
+// message and investigate its text.
+func TestReactionTriggersInvestigation(t *testing.T) {
+	a := newAuroraStub()
+	defer a.close()
+	sl := newSlackStub()
+	defer sl.close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	conn := newTestConnector(t, a, sl)
+	conn.Start(ctx)
+
+	// The message a human reacts on.
+	sl.setMessage(slackMessage{Type: "message", User: "U1", Text: "checkout is 500ing", TS: "400.1"})
+	conn.dispatchEvent(slackEnvelope{Type: "event_callback", Event: slackEvent{
+		Type: "reaction_added", User: "U2", Reaction: "eyes",
+		Item: reactionItem{Type: "message", Channel: "C1", TS: "400.1"},
+	}})
+
+	waitForPost(t, sl.postCh, "Re: checkout is 500ing", 3*time.Second)
+	a.mu.Lock()
+	pc := a.processCreates
+	name := ""
+	for n := range a.sessionByName {
+		name = n
 	}
-	rec := httptest.NewRecorder()
-	conn.Handler().ServeHTTP(rec, req)
-	if rec.Code != 200 || rec.Body.String() != "abc123" {
-		t.Fatalf("challenge handshake: code=%d body=%q", rec.Code, rec.Body.String())
+	a.mu.Unlock()
+	if pc != 1 {
+		t.Fatalf("reaction trigger did not run a process: %d", pc)
+	}
+	if name != "slack:400.1" {
+		t.Fatalf("session name = %q, want slack:400.1 (thread rooted at the reacted message)", name)
 	}
 }
 
-func TestHandleEventsRejectsBadSignature(t *testing.T) {
+// A wrong reaction, a reaction in another channel, and a reaction on a bot
+// message are all ignored.
+func TestReactionIgnoresNonTriggers(t *testing.T) {
 	a := newAuroraStub()
 	defer a.close()
 	sl := newSlackStub()
 	defer sl.close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	conn := newTestConnector(t, a, sl)
-	conn.ctx = context.Background()
+	conn.Start(ctx)
 
-	body := `{"type":"url_verification","challenge":"abc"}`
-	req := httptest.NewRequest(http.MethodPost, "/slack/events", strings.NewReader(body))
-	req.Header.Set("X-Slack-Request-Timestamp", fmt.Sprintf("%d", time.Now().Unix()))
-	req.Header.Set("X-Slack-Signature", "v0=deadbeef")
-	rec := httptest.NewRecorder()
-	conn.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("bad signature accepted: code=%d", rec.Code)
+	sl.setMessage(slackMessage{Type: "message", User: "U1", Text: "hi", TS: "401.1"})
+	sl.setMessage(slackMessage{Type: "message", BotID: "B1", Text: "bot post", TS: "401.2"})
+
+	// Wrong emoji.
+	conn.dispatchEvent(slackEnvelope{Type: "event_callback", Event: slackEvent{
+		Type: "reaction_added", User: "U2", Reaction: "thumbsup",
+		Item: reactionItem{Type: "message", Channel: "C1", TS: "401.1"}}})
+	// Right emoji, wrong channel.
+	conn.dispatchEvent(slackEnvelope{Type: "event_callback", Event: slackEvent{
+		Type: "reaction_added", User: "U2", Reaction: "eyes",
+		Item: reactionItem{Type: "message", Channel: "C-other", TS: "401.1"}}})
+	// Right emoji, but the reacted message is a bot post.
+	conn.dispatchEvent(slackEnvelope{Type: "event_callback", Event: slackEvent{
+		Type: "reaction_added", User: "U2", Reaction: "eyes",
+		Item: reactionItem{Type: "message", Channel: "C1", TS: "401.2"}}})
+
+	time.Sleep(150 * time.Millisecond)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.processCreates != 0 {
+		t.Fatalf("a non-trigger reaction started work: %d processes", a.processCreates)
+	}
+}
+
+// The bot acknowledges a message it works on: 👀 when it starts, then the
+// working reaction is removed and a ✅ added when the process completes.
+func TestAckReactionsAddedAndSwapped(t *testing.T) {
+	a := newAuroraStub()
+	defer a.close()
+	sl := newSlackStub()
+	defer sl.close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	conn := newTestConnector(t, a, sl)
+	conn.Start(ctx)
+
+	conn.dispatchEvent(mentionEvent("U1", "<@UBOT> look into it", "500.1", ""))
+	waitForPost(t, sl.postCh, "Re: look into it", 3*time.Second)
+
+	got := map[string]bool{}
+	deadline := time.After(2 * time.Second)
+	for len(got) < 3 {
+		select {
+		case r := <-sl.reactCh:
+			got[r] = true
+		case <-deadline:
+			t.Fatalf("did not observe the expected reaction acks; saw %v", got)
+		}
+	}
+	for _, want := range []string{"add:eyes:500.1", "remove:eyes:500.1", "add:white_check_mark:500.1"} {
+		if !got[want] {
+			t.Fatalf("missing reaction ack %q; saw %v", want, got)
+		}
 	}
 }
 

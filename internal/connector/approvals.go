@@ -4,9 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
-	"net/url"
 	"strings"
 	"time"
 )
@@ -132,37 +129,15 @@ type interactionPayload struct {
 	} `json:"actions"`
 }
 
-// handleInteractions receives interactive component events (button clicks).
-// Slack sends them form-encoded with a single `payload` field; the signature
-// still covers the raw body, so it is verified before anything is parsed.
-func (c *Connector) handleInteractions(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes))
-	if err != nil {
-		http.Error(w, "read error", http.StatusBadRequest)
-		return
-	}
-	if err := VerifySlackSignature(c.cfg.SlackSigningSecret, r.Header, body, time.Now()); err != nil {
-		c.logger.Warn("rejected slack interaction", "error", err)
-		http.Error(w, "invalid signature", http.StatusUnauthorized)
-		return
-	}
-	form, err := url.ParseQuery(string(body))
-	if err != nil {
-		http.Error(w, "bad form", http.StatusBadRequest)
-		return
-	}
-	raw := form.Get("payload")
-	if raw == "" {
-		w.WriteHeader(http.StatusOK)
-		return
-	}
+// handleInteractionPayload receives one Socket Mode interactive payload (a
+// block_actions JSON — Approve/Deny button clicks). The socket loop has already
+// acknowledged the envelope, so resolution runs on its own goroutine.
+func (c *Connector) handleInteractionPayload(payload []byte) {
 	var p interactionPayload
-	if err := json.Unmarshal([]byte(raw), &p); err != nil {
+	if err := json.Unmarshal(payload, &p); err != nil {
 		c.logger.Warn("decode interaction payload", "error", err)
-		http.Error(w, "bad payload", http.StatusBadRequest)
 		return
 	}
-	w.WriteHeader(http.StatusOK) // ack fast; resolve asynchronously
 	go c.handleInteraction(p)
 }
 

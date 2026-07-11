@@ -3,21 +3,19 @@ package connector
 import (
 	"bytes"
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 )
 
 // SlackClient calls the Slack Web API: auth.test to learn the bot's identity at
-// startup, and chat.postMessage / chat.update to speak in a thread. Just enough
-// of the API for a single-channel duty bot, over the standard library — no SDK.
+// startup, chat.postMessage / chat.update to speak in a thread, reactions.add /
+// reactions.remove to acknowledge a message, and conversations.history to read a
+// message a user reacted on. Just enough of the API for a single-channel duty
+// bot, over the standard library — no SDK.
 type SlackClient struct {
 	token   string
 	baseURL string // https://slack.com/api, overridable in tests
@@ -45,16 +43,25 @@ func (c *SlackClient) SetAPIBaseURL(u string) {
 	}
 }
 
-// slackResponse is the envelope every Web API method returns.
+// slackResponse is the subset of a Web API reply the simple methods read.
 type slackResponse struct {
 	OK    bool   `json:"ok"`
 	Error string `json:"error"`
 	// chat.postMessage / chat.update
-	TS      string `json:"ts"`
-	Channel string `json:"channel"`
+	TS string `json:"ts"`
 	// auth.test
 	UserID string `json:"user_id"`
-	Team   string `json:"team"`
+}
+
+// slackMessage is one message from conversations.history.
+type slackMessage struct {
+	Type     string `json:"type"`
+	Subtype  string `json:"subtype"`
+	User     string `json:"user"`
+	BotID    string `json:"bot_id"`
+	Text     string `json:"text"`
+	TS       string `json:"ts"`
+	ThreadTS string `json:"thread_ts"`
 }
 
 // AuthTest returns the bot's own user id, so the connector can strip the leading
@@ -106,7 +113,61 @@ func (c *SlackClient) PostBlockMessage(ctx context.Context, channel, threadTS, t
 	return out.TS, nil
 }
 
-func (c *SlackClient) call(ctx context.Context, method string, body map[string]any, out *slackResponse) error {
+// AddReaction adds an emoji reaction (name without colons, e.g. "eyes") to a
+// message. An already-present reaction is treated as success — reaction acks are
+// idempotent.
+func (c *SlackClient) AddReaction(ctx context.Context, channel, timestamp, name string) error {
+	body := map[string]any{"channel": channel, "timestamp": timestamp, "name": name}
+	var out slackResponse
+	err := c.call(ctx, "reactions.add", body, &out)
+	if err != nil && strings.Contains(err.Error(), "already_reacted") {
+		return nil
+	}
+	return err
+}
+
+// RemoveReaction removes one of the bot's reactions from a message. A reaction
+// that is already absent is treated as success.
+func (c *SlackClient) RemoveReaction(ctx context.Context, channel, timestamp, name string) error {
+	body := map[string]any{"channel": channel, "timestamp": timestamp, "name": name}
+	var out slackResponse
+	err := c.call(ctx, "reactions.remove", body, &out)
+	if err != nil && strings.Contains(err.Error(), "no_reaction") {
+		return nil
+	}
+	return err
+}
+
+// GetMessage fetches a single channel message by its ts (the message a user
+// reacted on). found is false when the timestamp names no message the bot can
+// read — e.g. a thread reply, which conversations.history does not return.
+func (c *SlackClient) GetMessage(ctx context.Context, channel, ts string) (msg slackMessage, found bool, err error) {
+	body := map[string]any{
+		"channel":   channel,
+		"latest":    ts,
+		"oldest":    ts,
+		"inclusive": true,
+		"limit":     1,
+	}
+	var out struct {
+		slackResponse
+		Messages []slackMessage `json:"messages"`
+	}
+	if err := c.call(ctx, "conversations.history", body, &out); err != nil {
+		return slackMessage{}, false, err
+	}
+	for _, m := range out.Messages {
+		if m.TS == ts {
+			return m, true, nil
+		}
+	}
+	return slackMessage{}, false, nil
+}
+
+// call performs one Web API method call and decodes the reply into out (any
+// struct exposing the ok/error envelope). It fails on a transport error, a
+// non-200, or an ok:false response.
+func (c *SlackClient) call(ctx context.Context, method string, body map[string]any, out any) error {
 	raw, err := json.Marshal(body)
 	if err != nil {
 		return err
@@ -122,47 +183,24 @@ func (c *SlackClient) call(ctx context.Context, method string, body map[string]a
 		return fmt.Errorf("slack %s: %w", method, err)
 	}
 	defer resp.Body.Close()
-	payload, err := io.ReadAll(resp.Body)
+	payload, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
 	if err != nil {
 		return fmt.Errorf("slack %s: read body: %w", method, err)
 	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("slack %s: http %d: %s", method, resp.StatusCode, strings.TrimSpace(string(payload)))
 	}
-	if err := json.Unmarshal(payload, out); err != nil {
+	var status slackResponse
+	if err := json.Unmarshal(payload, &status); err != nil {
 		return fmt.Errorf("slack %s: decode: %w", method, err)
 	}
-	if !out.OK {
-		return fmt.Errorf("slack %s: %s", method, out.Error)
+	if !status.OK {
+		return fmt.Errorf("slack %s: %s", method, status.Error)
 	}
-	return nil
-}
-
-// VerifySlackSignature checks an inbound Events API request against the signing
-// secret: HMAC-SHA256 over "v0:<timestamp>:<rawBody>", compared in constant
-// time, with a five-minute freshness window to blunt replays. rawBody must be
-// the exact bytes Slack sent (the signature is over the wire body).
-func VerifySlackSignature(signingSecret string, header http.Header, rawBody []byte, now time.Time) error {
-	timestamp := header.Get("X-Slack-Request-Timestamp")
-	signature := header.Get("X-Slack-Signature")
-	if timestamp == "" || signature == "" {
-		return fmt.Errorf("missing slack signature headers")
-	}
-	ts, err := strconv.ParseInt(timestamp, 10, 64)
-	if err != nil {
-		return fmt.Errorf("bad slack timestamp %q", timestamp)
-	}
-	if delta := now.Unix() - ts; delta > 300 || delta < -300 {
-		return fmt.Errorf("stale slack timestamp (%ds skew)", delta)
-	}
-	mac := hmac.New(sha256.New, []byte(signingSecret))
-	mac.Write([]byte("v0:"))
-	mac.Write([]byte(timestamp))
-	mac.Write([]byte(":"))
-	mac.Write(rawBody)
-	expected := "v0=" + hex.EncodeToString(mac.Sum(nil))
-	if !hmac.Equal([]byte(expected), []byte(signature)) {
-		return fmt.Errorf("slack signature mismatch")
+	if out != nil {
+		if err := json.Unmarshal(payload, out); err != nil {
+			return fmt.Errorf("slack %s: decode: %w", method, err)
+		}
 	}
 	return nil
 }
