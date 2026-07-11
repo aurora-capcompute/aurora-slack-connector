@@ -19,15 +19,16 @@ import (
 // process completes after two polls, and its answer echoes its input so a test
 // can trace the round trip.
 type auroraStub struct {
-	mu             sync.Mutex
-	server         *httptest.Server
-	sessionByName  map[string]string
-	nextSession    int
-	nextProcess    int
-	inputByProc    map[string]string
-	pollsByProc    map[string]int
-	sessionCreates int
-	processCreates int
+	mu                sync.Mutex
+	server            *httptest.Server
+	sessionByName     map[string]string
+	nextSession       int
+	nextProcess       int
+	inputByProc       map[string]string
+	pollsByProc       map[string]int
+	sessionCreates    int
+	processCreates    int
+	rejectProcessEcho bool // reject createProcess with a 400 that echoes the input
 }
 
 func newAuroraStub() *auroraStub {
@@ -89,6 +90,14 @@ func (s *auroraStub) createProcess(w http.ResponseWriter, r *http.Request) {
 	sessionID := r.PathValue("id")
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.rejectProcessEcho {
+		// Aurora rejecting a process and echoing the guest's input back in the
+		// error message — the path that would carry an injected token into Slack.
+		w.WriteHeader(http.StatusBadRequest)
+		raw, _ := json.Marshal(map[string]string{"error": "input rejected: " + in.Input, "code": "invalid"})
+		_, _ = w.Write(raw)
+		return
+	}
 	s.nextProcess++
 	id := fmt.Sprintf("proc_%d", s.nextProcess)
 	s.inputByProc[id] = in.Input
@@ -141,18 +150,21 @@ func (s *auroraStub) getSession(w http.ResponseWriter, r *http.Request) {
 // channel. messages seeds conversations.history so a reaction trigger can read
 // the message it fired on.
 type slackStub struct {
-	server   *httptest.Server
-	mu       sync.Mutex
-	posts    int
-	updates  int
-	postCh   chan string
-	reactCh  chan string             // "add:name:ts" / "remove:name:ts"
-	messages map[string]slackMessage // ts -> message for conversations.history
+	server          *httptest.Server
+	mu              sync.Mutex
+	posts           int
+	updates         int
+	postCh          chan string
+	updateCh        chan string             // text of each chat.update
+	reactCh         chan string             // "add:name:ts" / "remove:name:ts"
+	messages        map[string]slackMessage // ts -> message for conversations.history
+	historyFailures int                     // fail this many conversations.history calls first
 }
 
 func newSlackStub() *slackStub {
 	s := &slackStub{
 		postCh:   make(chan string, 64),
+		updateCh: make(chan string, 64),
 		reactCh:  make(chan string, 64),
 		messages: map[string]slackMessage{},
 	}
@@ -180,6 +192,12 @@ func newSlackStub() *slackStub {
 			s.mu.Lock()
 			s.updates++
 			s.mu.Unlock()
+			if text, _ := in["text"].(string); true {
+				select {
+				case s.updateCh <- text:
+				default:
+				}
+			}
 			_, _ = w.Write([]byte(`{"ok":true}`))
 		case "/reactions.add", "/reactions.remove":
 			verb := "add"
@@ -196,6 +214,12 @@ func newSlackStub() *slackStub {
 		case "/conversations.history":
 			latest, _ := in["latest"].(string)
 			s.mu.Lock()
+			if s.historyFailures > 0 {
+				s.historyFailures--
+				s.mu.Unlock()
+				_, _ = w.Write([]byte(`{"ok":false,"error":"ratelimited"}`))
+				return
+			}
 			msg, ok := s.messages[latest]
 			s.mu.Unlock()
 			if !ok {
@@ -472,6 +496,37 @@ func TestReactionTriggersInvestigation(t *testing.T) {
 	}
 }
 
+// A transient conversations.history failure must not permanently consume the
+// reaction trigger: the dedup key is released so a later reaction re-triggers.
+func TestReactionRetriesAfterTransientFetchFailure(t *testing.T) {
+	a := newAuroraStub()
+	defer a.close()
+	sl := newSlackStub()
+	defer sl.close()
+	sl.historyFailures = 1 // the first fetch fails
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	conn := newTestConnector(t, a, sl)
+	conn.Start(ctx)
+
+	sl.setMessage(slackMessage{Type: "message", User: "U1", Text: "check the db", TS: "410.1"})
+	react := slackEnvelope{Type: "event_callback", Event: slackEvent{
+		Type: "reaction_added", User: "U2", Reaction: "eyes",
+		Item: reactionItem{Type: "message", Channel: "C1", TS: "410.1"}}}
+
+	conn.dispatchEvent(react) // first: history fails, key released, no investigation
+	time.Sleep(100 * time.Millisecond)
+	a.mu.Lock()
+	pc := a.processCreates
+	a.mu.Unlock()
+	if pc != 0 {
+		t.Fatalf("investigation ran despite the fetch failure: %d", pc)
+	}
+
+	conn.dispatchEvent(react) // second: history succeeds, the trigger is not deduped away
+	waitForPost(t, sl.postCh, "Re: check the db", 3*time.Second)
+}
+
 // A wrong reaction, a reaction in another channel, and a reaction on a bot
 // message are all ignored.
 func TestReactionIgnoresNonTriggers(t *testing.T) {
@@ -537,6 +592,85 @@ func TestAckReactionsAddedAndSwapped(t *testing.T) {
 		if !got[want] {
 			t.Fatalf("missing reaction ack %q; saw %v", want, got)
 		}
+	}
+}
+
+func TestEscapeSlack(t *testing.T) {
+	cases := map[string]string{
+		"<!channel> now":   "&lt;!channel&gt; now",
+		"ping <@U123>":     "ping &lt;@U123&gt;",
+		"a & b < c > d":    "a &amp; b &lt; c &gt; d",
+		"<https://x|safe>": "&lt;https://x|safe&gt;",
+		"plain text":       "plain text",
+	}
+	for in, want := range cases {
+		if got := escapeSlack(in); got != want {
+			t.Errorf("escapeSlack(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// codeSpan must strip interior backticks: that is the only way to break out of a
+// mrkdwn inline-code span, so a value carrying one could otherwise smuggle a live
+// <!channel>/<@U…> past the surrounding backticks.
+func TestCodeSpan(t *testing.T) {
+	cases := map[string]string{
+		"internet.fetch":         "`internet.fetch`",
+		"a`<!channel>`b":         "`a'<!channel>'b`",
+		"trailing`":              "`trailing'`",
+		"{\"url\":\"http://x\"}": "`{\"url\":\"http://x\"}`",
+	}
+	for in, want := range cases {
+		got := codeSpan(in)
+		if got != want {
+			t.Errorf("codeSpan(%q) = %q, want %q", in, got, want)
+		}
+		if strings.Contains(got[1:len(got)-1], "`") {
+			t.Errorf("codeSpan(%q) left an interior backtick: %q", in, got)
+		}
+	}
+}
+
+// A model answer that carries a Slack broadcast token is posted escaped, so it
+// cannot make the bot @-broadcast the channel.
+func TestOutcomeEscapesBroadcastInjection(t *testing.T) {
+	a := newAuroraStub()
+	defer a.close()
+	sl := newSlackStub()
+	defer sl.close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	conn := newTestConnector(t, a, sl)
+	conn.Start(ctx)
+
+	// The stub echoes the input as the answer, so this rides through to postOutcome.
+	conn.dispatchEvent(mentionEvent("U1", "<@UBOT> repeat <!channel> please", "900.1", ""))
+	answer := waitForPost(t, sl.postCh, "&lt;!channel&gt;", 3*time.Second)
+	if strings.Contains(answer, "<!channel>") {
+		t.Fatalf("answer posted an un-escaped broadcast token: %q", answer)
+	}
+}
+
+// An aurora error that echoes the guest's input (here, a rejected process
+// creation) is posted escaped too — the control-plane error path is not a hole in
+// the broadcast-injection defense.
+func TestSpawnErrorEscapesEchoedInput(t *testing.T) {
+	a := newAuroraStub()
+	a.rejectProcessEcho = true
+	defer a.close()
+	sl := newSlackStub()
+	defer sl.close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	conn := newTestConnector(t, a, sl)
+	conn.Start(ctx)
+
+	conn.dispatchEvent(mentionEvent("U1", "<@UBOT> please <!channel>", "901.1", ""))
+	// report() rewrites the "queued" status message in place, so the error text
+	// arrives as a chat.update rather than a fresh post.
+	msg := waitForPost(t, sl.updateCh, "couldn't start the investigation", 3*time.Second)
+	if strings.Contains(msg, "<!channel>") {
+		t.Fatalf("spawn error posted an un-escaped broadcast token: %q", msg)
 	}
 }
 

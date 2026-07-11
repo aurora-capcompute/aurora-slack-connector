@@ -28,6 +28,11 @@ type AuroraClient struct {
 	http    *http.Client
 }
 
+// maxAuroraResponseBytes backstops the response read in do(). It is generous —
+// a session log grows with the investigation — but bounded so a runaway or buggy
+// response cannot exhaust the connector's memory.
+const maxAuroraResponseBytes = 16 << 20 // 16 MiB
+
 // NewAuroraClient returns a client for the aurora-dist base URL (e.g.
 // http://localhost:8080). timeout bounds each individual request.
 func NewAuroraClient(baseURL string, timeout time.Duration) *AuroraClient {
@@ -369,7 +374,10 @@ func (c *AuroraClient) do(ctx context.Context, method, path string, body, out an
 		return fmt.Errorf("aurora %s %s: %w", method, path, err)
 	}
 	defer resp.Body.Close()
-	raw, err := io.ReadAll(resp.Body)
+	// Bound the read (like the Slack and socket clients do). aurora is a trusted
+	// local process, so the ceiling is generous — well above any realistic session
+	// log — and exists only as a backstop against a runaway response.
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxAuroraResponseBytes))
 	if err != nil {
 		return fmt.Errorf("aurora %s %s: read body: %w", method, path, err)
 	}

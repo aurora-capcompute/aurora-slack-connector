@@ -32,6 +32,9 @@ const (
 	ackTimeout = 5 * time.Second
 	// reconnectMax caps the backoff between reconnect attempts.
 	reconnectMax = 30 * time.Second
+	// reconnectFloor is the minimum delay between reconnects, so a peer that
+	// disconnects immediately cannot spin us into a tight reconnect loop.
+	reconnectFloor = time.Second
 )
 
 // socketEnvelope is the Socket Mode frame wrapping each payload. type is one of
@@ -93,41 +96,58 @@ func (s *SocketMode) SetAPIBaseURL(u string) {
 }
 
 // Run keeps a Socket Mode connection alive until ctx is cancelled, reconnecting
-// with capped backoff on any disconnect or error.
+// with capped exponential backoff on failure and a small floor after a clean
+// disconnect.
 func (s *SocketMode) Run(ctx context.Context) {
-	backoff := time.Second
+	backoff := reconnectFloor
 	for ctx.Err() == nil {
-		if err := s.connectOnce(ctx); err != nil && ctx.Err() == nil {
+		established, err := s.connectOnce(ctx)
+		if ctx.Err() != nil {
+			return
+		}
+		// A connection that actually came up resets the backoff: a long-healthy
+		// session that later drops reconnects promptly instead of inheriting a
+		// stale (possibly maxed-out) delay from earlier failures.
+		if established {
+			backoff = reconnectFloor
+		}
+		delay := backoff
+		if err == nil {
+			delay = reconnectFloor // clean disconnect (Slack asked us to reconnect)
+		} else {
 			s.logger.Warn("socket mode connection ended; reconnecting", "error", err, "backoff", backoff)
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(backoff):
-			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+		if err != nil {
 			if backoff *= 2; backoff > reconnectMax {
 				backoff = reconnectMax
 			}
-			continue
 		}
-		backoff = time.Second // a clean session resets the backoff
 	}
 }
 
-// connectOnce opens one WebSocket and reads it to completion (a disconnect, a
-// read error, or ctx cancellation).
-func (s *SocketMode) connectOnce(ctx context.Context) error {
+// connectOnce opens one WebSocket and reads it to completion. established reports
+// whether the socket was actually dialed (so the caller can reset its backoff);
+// err is nil on a clean disconnect and non-nil on a failure or read error.
+func (s *SocketMode) connectOnce(ctx context.Context) (established bool, err error) {
 	url, err := s.openConnection(ctx)
 	if err != nil {
-		return fmt.Errorf("apps.connections.open: %w", err)
+		return false, fmt.Errorf("apps.connections.open: %w", err)
 	}
 	conn, err := s.dial(ctx, url)
 	if err != nil {
-		return fmt.Errorf("dial: %w", err)
+		return false, fmt.Errorf("dial: %w", err)
 	}
-	defer conn.Close(websocket.StatusNormalClosure, "")
+	// CloseNow rather than the close handshake: on the error path the socket may
+	// be broken, and we are reconnecting anyway.
+	defer conn.CloseNow()
 	conn.SetReadLimit(socketReadLimit)
 	s.logger.Info("socket mode connected")
-	return s.readLoop(ctx, conn)
+	return true, s.readLoop(ctx, conn)
 }
 
 // readLoop reads envelopes, acknowledges each, and dispatches events_api /

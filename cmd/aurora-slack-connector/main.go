@@ -1,10 +1,10 @@
-// Command aurora-slack-connector is a small HTTP server that bridges one Slack
-// channel to a local aurora-dist instance, turning it into an on-call "duty
-// bot": mention it (or use the configured trigger) in the channel and it opens
-// an aurora session for the thread, runs your message as a process, and narrates
-// the syscalls back into the thread while it works. Follow-up messages in the
-// thread run as further processes in the same session, so the investigation
-// shares history.
+// Command aurora-slack-connector bridges one Slack channel to a local
+// aurora-dist instance over Slack Socket Mode, turning it into an on-call "duty
+// bot": mention it (or use the configured trigger or reaction) in the channel and
+// it opens an aurora session for the thread, runs your message as a process, and
+// narrates the syscalls back into the thread while it works. Follow-up messages
+// in the thread run as further processes in the same session, so the
+// investigation shares history. The only HTTP it serves is a /healthz probe.
 //
 // Configuration is entirely by environment variable — see LoadConfig and the
 // README. The connector holds no secrets of its own: the LLM endpoint and the
@@ -59,6 +59,9 @@ func main() {
 		Addr:              cfg.Addr,
 		Handler:           conn.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

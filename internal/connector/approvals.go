@@ -10,7 +10,7 @@ import (
 
 // Human-in-the-loop: when a process is parked on a pending approval task, the
 // connector posts an interactive Approve/Deny prompt into the thread. A click
-// arrives at the interactions endpoint, is verified, and is turned into a
+// arrives as a Socket Mode interactive payload and is turned into a
 // POST /v1/tasks/{id}/resolve — after which aurora resumes the parked process
 // and the poll loop carries on to the answer.
 
@@ -46,12 +46,17 @@ func (c *Connector) postApprovalPrompt(ctx context.Context, t *thread, tk Task) 
 }
 
 // approvalSummary is the one-line human description of what is being approved.
+// tk.Summary and the syscall name are model/guest-influenced and are rendered
+// into Slack mrkdwn (the prompt and its notification fallback), so they are
+// escaped here — the single place every approval-prompt string is built — to
+// keep an injected <!channel>/<@U…> out of a message an operator is asked to act
+// on.
 func approvalSummary(tk Task) string {
 	if s := strings.TrimSpace(tk.Summary); s != "" {
-		return s
+		return escapeSlack(s)
 	}
 	if tk.Syscall.Name != "" {
-		return "run `" + tk.Syscall.Name + "`"
+		return "run " + codeSpan(tk.Syscall.Name)
 	}
 	return "perform an action"
 }
@@ -61,10 +66,10 @@ func approvalSummary(tk Task) string {
 func approvalBlocks(tk Task, value string) []map[string]any {
 	text := "🔐 *Approval needed* — the duty bot wants to " + approvalSummary(tk)
 	if tk.Syscall.Name != "" {
-		text += "\n• syscall: `" + tk.Syscall.Name + "`"
+		text += "\n• syscall: " + codeSpan(tk.Syscall.Name)
 	}
 	if snippet := argsSnippet(tk.Syscall.Args); snippet != "" {
-		text += "\n• args: `" + snippet + "`"
+		text += "\n• args: " + codeSpan(snippet)
 	}
 	if tk.ExpiresAt != nil {
 		text += "\n• expires: " + tk.ExpiresAt.UTC().Format(time.RFC3339)
@@ -97,17 +102,17 @@ func button(actionID, label, style, value string) map[string]any {
 
 // argsSnippet renders a bounded, single-line view of a syscall's args for the
 // prompt (the decision-relevant content of an approval — the URL being fetched,
-// the value being written). Backticks are dropped so the guest's args can't
-// break out of the surrounding mrkdwn code span.
+// the value being written). The caller wraps the result with codeSpan, which
+// neutralizes any backticks, so this only has to collapse and bound the text.
 func argsSnippet(raw json.RawMessage) string {
-	s := strings.ReplaceAll(collapseSpaces(string(raw)), "`", "'")
+	s := collapseSpaces(string(raw))
 	if s == "" || s == "null" {
 		return ""
 	}
 	return truncate(s, 300)
 }
 
-// --- interactions endpoint ---
+// --- interaction handling ---
 
 // interactionPayload is the subset of Slack's block_actions payload we use.
 type interactionPayload struct {
@@ -141,7 +146,8 @@ func (c *Connector) handleInteractionPayload(payload []byte) {
 	go c.handleInteraction(p)
 }
 
-// handleInteraction maps a verified button click to a task resolution.
+// handleInteraction maps a button click (delivered over the authenticated Socket
+// Mode connection) to a task resolution.
 func (c *Connector) handleInteraction(p interactionPayload) {
 	if p.Type != "block_actions" || len(p.Actions) == 0 {
 		return
@@ -196,7 +202,7 @@ func (c *Connector) resolveApproval(p interactionPayload, v buttonValue, decisio
 			return
 		}
 		c.logger.Error("resolve task", "task", tk.ID, "decision", decision, "error", err)
-		c.updatePrompt(ctx, p, "⚠️ Failed to record the decision: "+oneLine(err.Error()))
+		c.updatePrompt(ctx, p, "⚠️ Failed to record the decision: "+escapeSlack(oneLine(err.Error())))
 		return
 	}
 	c.logger.Info("resolved approval", "task", tk.ID, "decision", decision, "actor", actor)

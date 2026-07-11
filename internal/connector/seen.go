@@ -37,3 +37,21 @@ func (s *seenSet) add(key string) bool {
 	}
 	return true
 }
+
+// forget removes a key so it can be recorded again. It undoes an optimistic
+// add() when the work that add guarded could not be started (a transient
+// error), so a retry or a later redelivery is not silently deduped away.
+func (s *seenSet) forget(key string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.set[key]; !ok {
+		return
+	}
+	delete(s.set, key)
+	for i, k := range s.order {
+		if k == key {
+			s.order = append(s.order[:i], s.order[i+1:]...)
+			break
+		}
+	}
+}

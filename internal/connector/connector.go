@@ -22,13 +22,19 @@ const (
 const (
 	// inboxBuffer bounds the messages queued for one thread's worker.
 	inboxBuffer = 64
-	// maxBodyBytes caps an inbound Slack request body.
+	// maxBodyBytes caps an HTTP response body the connector reads (the Slack Web
+	// API replies and the apps.connections.open response).
 	maxBodyBytes = 1 << 20
 	// seenCapacity bounds the event-dedup memory.
 	seenCapacity = 4096
 	// idleTimeout retires a thread worker after a spell of no messages; its
 	// aurora session survives and is reattached by name on the next message.
 	idleTimeout = 30 * time.Minute
+	// maxApprovalWait bounds how long a single poll will keep holding its timeout
+	// open for a pending human approval. Past it, live reporting stops (the
+	// process stays parked in aurora and resumes when someone acts on it or sends
+	// a follow-up), so a forgotten approval can't pin a worker goroutine forever.
+	maxApprovalWait = 2 * time.Hour
 )
 
 // Connector wires Slack to a local aurora-dist. It receives Slack events over a
@@ -93,7 +99,11 @@ func New(cfg Config, aurora *AuroraClient, slack *SlackClient, logger *slog.Logg
 }
 
 // Start resolves the bot's own identity (best effort) and records the base
-// context whose cancellation retires all workers.
+// context whose cancellation retires all workers. It must be called (and must
+// return) before Run: it sets botUserID and ctx without synchronization, which
+// is safe only because Run is what spawns every goroutine that reads them, so
+// those writes happen-before all reads and the fields are effectively immutable
+// thereafter.
 func (c *Connector) Start(ctx context.Context) {
 	c.ctx = ctx
 	if c.botUserID == "" {
@@ -251,11 +261,15 @@ func (c *Connector) handleReaction(ev slackEvent) {
 	}
 	// Only the first trigger reaction on a message starts an investigation;
 	// further reactions (by anyone) on the same message are no-ops.
-	if !c.seen.add("react:" + ev.Item.Channel + ":" + ev.Item.TS) {
+	key := "react:" + ev.Item.Channel + ":" + ev.Item.TS
+	if !c.seen.add(key) {
 		return
 	}
 	msg, found, err := c.slack.GetMessage(c.ctx, ev.Item.Channel, ev.Item.TS)
 	if err != nil {
+		// Transient: release the dedup key so a redelivery or another reaction can
+		// retry — the message was never actually investigated.
+		c.seen.forget(key)
 		c.logger.Warn("reaction: fetch message", "ts", ev.Item.TS, "error", err)
 		return
 	}
@@ -322,7 +336,7 @@ func (c *Connector) deliver(threadTS, text, messageTS string, trigger, isReply b
 	if err != nil {
 		c.logger.Error("ensure session", "thread", threadTS, "error", err)
 		if _, perr := c.slack.PostMessage(c.ctx, c.cfg.ChannelID, threadTS,
-			"❌ I couldn't reach aurora to start a session: "+oneLine(err.Error())); perr != nil {
+			"❌ I couldn't reach aurora to start a session: "+escapeSlack(oneLine(err.Error()))); perr != nil {
 			c.logger.Warn("post session error", "error", perr)
 		}
 		return
@@ -404,7 +418,7 @@ func (c *Connector) handleMessage(ctx context.Context, t *thread, msg inboundMsg
 
 	proc, err := c.spawn(ctx, t.sessionID, msg.text)
 	if err != nil {
-		c.report(ctx, t, statusTS, "❌ I couldn't start the investigation: "+oneLine(err.Error()))
+		c.report(ctx, t, statusTS, "❌ I couldn't start the investigation: "+escapeSlack(oneLine(err.Error())))
 		c.ackDone(ctx, msg.messageTS, StatusFailed)
 		return
 	}
@@ -488,7 +502,8 @@ func (c *Connector) waitSessionIdle(ctx context.Context, sessionID string, deadl
 // both to render the syscall timeline and to surface human-in-the-loop
 // approvals. On a terminal status it posts the final answer or error.
 func (c *Connector) pollProcess(ctx context.Context, t *thread, processID, statusTS, messageTS string) {
-	deadline := time.Now().Add(c.cfg.ProcessTimeout)
+	pollStart := time.Now()
+	deadline := pollStart.Add(c.cfg.ProcessTimeout)
 	ticker := time.NewTicker(c.cfg.PollInterval)
 	defer ticker.Stop()
 
@@ -511,12 +526,16 @@ func (c *Connector) pollProcess(ctx context.Context, t *thread, processID, statu
 			// The first poll always refreshes (lastJournalLen starts at -1).
 			if snap.JournalLength != lastJournalLen || IsTerminal(snap.Status) {
 				if log, lerr := c.aurora.GetSessionLog(ctx, t.sessionID); lerr != nil {
+					// Leave lastJournalLen unchanged so this refresh is retried next
+					// tick — advancing it on a failed fetch would skip every later
+					// refresh (the parked journal length stops changing), so a pending
+					// approval's task would never be seen and the thread would wedge.
 					c.logger.Warn("fetch session log", "session", t.sessionID, "error", lerr)
 				} else if pl := log.Process(processID); pl != nil {
 					entries = pl.Entries
 					tasks = pl.Tasks
+					lastJournalLen = snap.JournalLength
 				}
-				lastJournalLen = snap.JournalLength
 			}
 
 			// Surface any pending human approvals as interactive prompts (once
@@ -533,7 +552,10 @@ func (c *Connector) pollProcess(ctx context.Context, t *thread, processID, statu
 					prompted[tk.ID] = true
 				}
 			}
-			if awaiting {
+			// Hold the timeout open while a human decides — but only up to
+			// maxApprovalWait total, so a forgotten approval eventually releases the
+			// worker instead of pinning it and polling aurora forever.
+			if awaiting && time.Since(pollStart) < maxApprovalWait {
 				deadline = time.Now().Add(c.cfg.ProcessTimeout)
 			}
 
@@ -573,16 +595,16 @@ func (c *Connector) postOutcome(ctx context.Context, t *thread, snap ProcessSnap
 	switch snap.Status {
 	case StatusCompleted:
 		if answer := strings.TrimSpace(snap.Answer); answer != "" {
-			msg = answer
+			msg = escapeSlack(answer)
 		} else {
 			msg = "✅ Done — but the investigation returned no written answer."
 		}
 	case StatusFailed:
-		msg = "❌ The investigation failed: " + oneLine(snap.Error)
+		msg = "❌ The investigation failed: " + escapeSlack(oneLine(snap.Error))
 	case StatusStopped:
 		msg = "🛑 The investigation was stopped."
 	case StatusCompensated:
-		msg = "↩️ The investigation was rolled back: " + oneLine(snap.Error)
+		msg = "↩️ The investigation was rolled back: " + escapeSlack(oneLine(snap.Error))
 	default:
 		return
 	}
@@ -676,7 +698,7 @@ func collapseSpaces(s string) string {
 func normalizeInput(s string) string {
 	lines := strings.Split(s, "\n")
 	for i, line := range lines {
-		lines[i] = strings.Join(strings.Fields(line), " ")
+		lines[i] = collapseSpaces(line)
 	}
 	return strings.TrimSpace(strings.Join(lines, "\n"))
 }
@@ -689,6 +711,28 @@ func truncate(s string, max int) string {
 		return s
 	}
 	return string(r[:max]) + "…"
+}
+
+// escapeSlack neutralizes the three characters Slack parses as mrkdwn control
+// syntax, so untrusted free text (a model answer, an error, an approval summary)
+// posted as a message cannot inject mentions or broadcasts: <!channel>/<!here>,
+// <@U…> pings, or <url|label> link spoofs. Escape & first so the &lt;/&gt;
+// entities it emits are not themselves re-escaped. Use it for values shown as
+// plain text; use codeSpan for values shown as `inline code`.
+func escapeSlack(s string) string {
+	s = strings.ReplaceAll(s, "&", "&amp;")
+	s = strings.ReplaceAll(s, "<", "&lt;")
+	s = strings.ReplaceAll(s, ">", "&gt;")
+	return s
+}
+
+// codeSpan wraps s in a mrkdwn inline-code span, replacing interior backticks so
+// the content cannot break out of the span. It is the inline-code analogue of
+// escapeSlack: inside a code span Slack does not parse <…> entities, so the only
+// breakout character is the backtick. Use it for guest/model-adjacent values
+// rendered as `code` (a syscall name, an args snippet).
+func codeSpan(s string) string {
+	return "`" + strings.ReplaceAll(s, "`", "'") + "`"
 }
 
 // oneLine flattens and bounds an error/detail string for a chat line.

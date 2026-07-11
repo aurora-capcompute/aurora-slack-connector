@@ -58,12 +58,13 @@ func TestResolveTaskClientBody(t *testing.T) {
 // approvalAurora is a stub that parks a process on a pending approval task and
 // completes it once the task is resolved.
 type approvalAurora struct {
-	server    *httptest.Server
-	mu        sync.Mutex
-	resolved  bool
-	decision  string
-	actor     string
-	resolveCh chan struct{}
+	server      *httptest.Server
+	mu          sync.Mutex
+	resolved    bool
+	decision    string
+	actor       string
+	resolveCh   chan struct{}
+	logFailures int // fail this many GET /v1/sessions/{id} calls first
 }
 
 func newApprovalAurora() *approvalAurora {
@@ -91,6 +92,12 @@ func newApprovalAurora() *approvalAurora {
 	mux.HandleFunc("GET /v1/sessions/{id}", func(w http.ResponseWriter, _ *http.Request) {
 		s.mu.Lock()
 		defer s.mu.Unlock()
+		if s.logFailures > 0 {
+			s.logFailures--
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"error":"transient","code":"internal"}`))
+			return
+		}
 		if s.resolved {
 			_, _ = w.Write([]byte(`{"session":{"id":"ses_1","active_process_id":""},"processes":[{"id":"proc_1","status":"completed","answer":"Mitigation applied.","entries":[{"position":0,"syscall":{"name":"sys.input"},"outcome":{"status":"result"}}],"tasks":[{"id":"task_1","state":"approved","syscall":{"name":"core.internet"},"resolution_token":"tok_1"}]}]}`))
 			return
@@ -275,5 +282,51 @@ func TestApprovalEndToEnd(t *testing.T) {
 	}
 	if !sawApprovedUpdate {
 		t.Error("approval prompt was not rewritten to an Approved outcome")
+	}
+}
+
+// A single transient GET /v1/sessions/{id} failure must not wedge the approval
+// flow: pollProcess retries the log fetch and still surfaces the pending
+// approval. Regression — the journal checkpoint was advanced even on a failed
+// fetch, so a parked process's task was never seen and the thread hung.
+func TestApprovalSurvivesTransientLogFailure(t *testing.T) {
+	a := newApprovalAurora()
+	defer a.close()
+	a.mu.Lock()
+	a.logFailures = 1 // the first session-log fetch (the one that would see the park) fails
+	a.mu.Unlock()
+	sl := newHITLSlack()
+	defer sl.close()
+
+	cfg := Config{
+		SlackAppToken:  "xapp-test",
+		ChannelID:      "C1",
+		TriggerKeyword: "@duty",
+		AuroraBaseURL:  a.server.URL,
+		Manifest:       json.RawMessage(`{"version":4}`),
+		PollInterval:   5 * time.Millisecond,
+		ProcessTimeout: 5 * time.Second,
+		HTTPTimeout:    2 * time.Second,
+	}
+	aurora := NewAuroraClient(a.server.URL, cfg.HTTPTimeout)
+	slack := NewSlackClient("xoxb-test", cfg.HTTPTimeout)
+	slack.baseURL = sl.server.URL
+	conn := New(cfg, aurora, slack, discardLogger())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	conn.Start(ctx)
+
+	conn.dispatchEvent(mentionEvent("U1", "<@UBOT> @duty apply the mitigation", "100.1", ""))
+
+	deadline := time.After(3 * time.Second)
+	for {
+		select {
+		case p := <-sl.postCh:
+			if p.hasBlocks {
+				return // the prompt appeared — the flow recovered from the failure
+			}
+		case <-deadline:
+			t.Fatal("no approval prompt after a transient log failure — the approval flow wedged")
+		}
 	}
 }
