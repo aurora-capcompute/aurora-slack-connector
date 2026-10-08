@@ -62,7 +62,6 @@ func (c *Connector) postApprovalPrompt(ctx context.Context, t *thread, tk Task) 
 func approvalParts(tk Task) (headline, details string) {
 	first, rest, _ := strings.Cut(strings.TrimSpace(tk.Summary), "\n")
 	first = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(first), "Approve"))
-	first = strings.TrimSpace(strings.TrimPrefix(first, ":"))
 	if key, description, ok := strings.Cut(first, ": "); ok && !strings.Contains(key, " ") {
 		first = description
 	}
