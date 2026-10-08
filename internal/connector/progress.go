@@ -1,35 +1,66 @@
 package connector
 
 import (
+	"encoding/json"
 	"fmt"
+	"net/url"
 	"strings"
 )
 
-// syscallLabel maps an aurora syscall name to a short, human-friendly line for
-// the Slack thread. The duty bot's whole point is legibility to an on-call
-// human, so the journal — normally an engineer's artifact — is narrated in
-// plain language.
-func syscallLabel(name string) string {
+// syscallLabel turns one journal entry into a short line for the Slack thread.
+// The duty bot's point is legibility to an on-call human, so the journal is
+// narrated in plain language. Protocol and housekeeping syscalls (savepoints,
+// progress notes, time) return "" and are not shown.
+func syscallLabel(name string, args json.RawMessage) string {
+	var call struct {
+		Operation string `json:"operation"`
+		Method    string `json:"method"`
+		URL       string `json:"url"`
+	}
+	_ = json.Unmarshal(args, &call)
 	switch name {
 	case "sys.input":
-		return "📥 read the request"
+		return "📥 Read the request"
 	case "sys.output":
-		return "📤 composing the answer"
+		return "📤 Wrote the answer"
 	case "core.openaiApi":
-		return "🧠 thinking"
+		return "🧠 Thinking"
 	case "core.internet":
-		return "🌐 querying the internet"
-	case "core.memory":
-		return "🗄️ consulting memory"
+		host := "the web"
+		if u, err := url.Parse(call.URL); err == nil && u.Host != "" {
+			host = u.Host
+		}
+		if call.Method == "" || strings.EqualFold(call.Method, "GET") {
+			return "🌐 Reading " + host
+		}
+		return "🌐 " + strings.ToUpper(call.Method) + " to " + host
+	case "core.httpTemplate":
+		return "🔌 Calling " + orDefault(call.Operation, "a service")
+	case "core.command":
+		return "🖥️ Running " + orDefault(call.Operation, "a command")
+	case "core.scratch":
+		if call.Operation == "put" {
+			return "🗒️ Saving notes"
+		}
+		return "🗒️ Checking notes"
 	case "sys.timer":
-		return "⏳ waiting on a timer"
-	case "sys.spawn":
-		return "🧵 delegating to a sub-agent"
-	case "sys.now", "sys.random":
-		return "" // housekeeping syscalls, not worth narrating
+		return "⏳ Waiting on a timer"
+	case "sys.declassify":
+		return "🔓 Asking to release labelled data"
+	case "sys.abort":
+		return "↩️ Starting a step again"
+	case "sys.begin", "sys.commit", "sys.log", "sys.now", "sys.random":
+		return ""
 	default:
 		return "⚙️ " + name
 	}
+}
+
+func orDefault(value, fallback string) string {
+	if value == "" {
+		return fallback
+	}
+	return value
 }
 
 // step is one collapsed run of the timeline: a label and how many consecutive
@@ -54,7 +85,7 @@ const maxTimelineSteps = 10
 func buildTimeline(entries []JournalEntry, running bool) []step {
 	var steps []step
 	for _, e := range entries {
-		label := syscallLabel(e.Syscall.Name)
+		label := syscallLabel(e.Syscall.Name, e.Syscall.Args)
 		if label == "" {
 			continue
 		}

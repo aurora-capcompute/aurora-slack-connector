@@ -38,18 +38,24 @@ and its secrets live in Aurora and in the manifest you give it.
   so the connector queues later messages of a thread. Different threads run in
   parallel.
 - **Progress by polling.** While a process runs, the connector polls Aurora and
-  keeps one status message up to date (for example `🧠 thinking`,
-  `🌐 querying the internet …`, where `…` marks the call in progress). Then it
-  posts the answer as a new message.
+  keeps one status message up to date: `🧠 Thinking`, `🌐 Reading
+  status.example.com`, `🔌 Calling search_onyx`, `🖥️ Running kubectl-get`.
+  A `…` marks the call in progress. Savepoints and other housekeeping calls
+  are not shown. Then it posts the answer as a new message.
+- **Interrupted runs.** A run can stop before it finishes: past the server's
+  time limit (`quantum_deadline_seconds`), or cut off by a restart. The
+  connector says so in the thread and posts a **Retry** button. A click resumes
+  the run where its journal stopped.
 
 ## Approvals
 
 A grant with `require_approval: true` makes Aurora park the process on a task
 (`waiting_for_task`). The connector then:
 
-1. Posts a prompt with the task's summary and arguments, and **Approve** /
-   **Deny** buttons. The status line shows `⏸️ waiting for your approval`, and
-   the process timeout waits.
+1. Posts a prompt that says what the bot wants to do, shows the exact call
+   (its arguments, or a command's resolved command line), shows when the
+   request expires, and has **Approve** / **Deny** buttons. The status line
+   shows `⏸️ waiting for your approval`, and the process timeout waits.
 2. On a click, verifies the Slack signature, reads the task again from the
    session (its state and `resolution_token`), and resolves it with the
    decision. The clicking user is the `actor` in the audit trail.
@@ -90,7 +96,7 @@ Slack credentials. The LLM endpoint, keys and grants are in the manifest.
 | `SLACK_SIGNING_SECRET` | yes | | Verifies requests from Slack |
 | `SLACK_CHANNEL_ID` | yes | | The one channel to serve |
 | `AURORA_MANIFEST` or `AURORA_MANIFEST_FILE` | yes | | The manifest for every process (JSON, or a path) |
-| `AURORA_BASE_URL` | | `http://localhost:8080` | The aurora-dist address |
+| `AURORA_BASE_URL` | | `http://localhost:8080` | The aurora-dist address. A host name other than `localhost` or an IP address must be in aurora-dist's `trusted_hosts`. |
 | `SLACK_TRIGGER_KEYWORD` | | `@duty` | A keyword that starts a thread. A mention of the bot always works. |
 | `SLACK_BOT_USER_ID` | | from `auth.test` | The bot's user id |
 | `SLACK_API_BASE_URL` | | `https://slack.com/api` | For a gateway or for tests |

@@ -116,12 +116,12 @@ func TestAuroraGetSessionLogProcessLookup(t *testing.T) {
 }
 
 func TestIsTerminal(t *testing.T) {
-	for _, s := range []string{StatusCompleted, StatusFailed, StatusStopped, StatusCompensated} {
+	for _, s := range []string{StatusCompleted, StatusFailed, StatusStopped, StatusInterrupted} {
 		if !IsTerminal(s) {
 			t.Errorf("%s should be terminal", s)
 		}
 	}
-	for _, s := range []string{StatusQueued, StatusRunning, StatusYielded, StatusWaitingTask, StatusInterrupted} {
+	for _, s := range []string{StatusQueued, StatusRunning, StatusWaitingTask} {
 		if IsTerminal(s) {
 			t.Errorf("%s should not be terminal", s)
 		}

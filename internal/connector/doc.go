@@ -16,6 +16,9 @@
 //   - When a process parks on a pending approval task, the connector posts
 //     Approve/Deny buttons; a click is verified, resolved through
 //     POST /v1/tasks/{id}/resolve, and the parked process resumes.
+//   - When a process is interrupted (past the server's time limit, or cut off
+//     by a restart), the connector says so and posts a Retry button; a click
+//     resumes the process through POST /v1/processes/{id}/retry.
 //
 // The connector holds no secrets of its own beyond the Slack credentials: the
 // LLM endpoint and the capability grants live in the operator-supplied aurora
@@ -25,8 +28,8 @@
 //
 //   - connector.go — the Connector type, lifecycle, HTTP mux, event ingestion
 //     and routing, the per-thread worker, and process polling.
-//   - approvals.go — human-in-the-loop: the interactions endpoint and the
-//     approval prompt/resolution flow.
+//   - approvals.go — the interactions endpoint, the approval prompt and its
+//     resolution, and the Retry button.
 //   - aurora.go    — the aurora-dist HTTP client (sessions, processes, tasks).
 //   - slack.go     — the Slack Web API client and request-signature verifier.
 //   - progress.go  — rendering the syscall journal as a human status timeline.

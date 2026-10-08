@@ -18,18 +18,23 @@ import (
 // and the poll loop carries on to the answer.
 
 // Button action ids. The decision is carried by which button was clicked; the
-// button value carries only the (non-secret) task and session ids.
+// button value carries only (non-secret) ids.
 const (
 	actionApprove = "duty_approve"
 	actionDeny    = "duty_deny"
+	actionRetry   = "duty_retry"
 )
 
 // buttonValue is encoded into each button's value. It deliberately holds no
 // secret: the resolution token is re-read from the session log at click time,
-// so it never lives in Slack and the flow survives a connector restart.
+// so it never lives in Slack and the flow survives a connector restart. An
+// approval button carries the task; a retry button carries the process and its
+// thread.
 type buttonValue struct {
-	Task    string `json:"t"`
+	Task    string `json:"t,omitempty"`
 	Session string `json:"s"`
+	Process string `json:"p,omitempty"`
+	Thread  string `json:"th,omitempty"`
 }
 
 // postApprovalPrompt posts one interactive approval request for a pending task.
@@ -39,7 +44,8 @@ func (c *Connector) postApprovalPrompt(ctx context.Context, t *thread, tk Task) 
 		c.logger.Warn("encode approval button", "task", tk.ID, "error", err)
 		return
 	}
-	fallback := "Approval needed: " + approvalSummary(tk)
+	headline, _ := approvalParts(tk)
+	fallback := "Approval needed: " + escapeMrkdwn(headline)
 	ts, err := c.slack.PostBlockMessage(ctx, c.cfg.ChannelID, t.threadTS, fallback, approvalBlocks(tk, string(value)))
 	if err != nil {
 		c.logger.Warn("post approval prompt", "task", tk.ID, "error", err)
@@ -48,36 +54,47 @@ func (c *Connector) postApprovalPrompt(ctx context.Context, t *thread, tk Task) 
 	c.logger.Info("posted approval prompt", "task", tk.ID, "syscall", tk.Syscall.Name, "message_ts", ts)
 }
 
-// approvalSummary is the one-line human description of what is being approved.
-func approvalSummary(tk Task) string {
-	if s := strings.TrimSpace(tk.Summary); s != "" {
-		return s
+// approvalParts splits a task's summary into a one-line headline and the
+// details below it. The runtime writes "Approve <capability>: <description>" on
+// the first line, and the arguments or the command line on the lines after.
+// The headline drops the "Approve" verb and the capability key, which the
+// prompt shows on its own.
+func approvalParts(tk Task) (headline, details string) {
+	first, rest, _ := strings.Cut(strings.TrimSpace(tk.Summary), "\n")
+	first = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(first), "Approve"))
+	first = strings.TrimSpace(strings.TrimPrefix(first, ":"))
+	if key, description, ok := strings.Cut(first, ": "); ok && !strings.Contains(key, " ") {
+		first = description
 	}
-	if tk.Syscall.Name != "" {
-		return "run `" + tk.Syscall.Name + "`"
+	if first == "" || !strings.Contains(first, " ") && strings.Contains(first, ".") {
+		// Only a capability key: say what kind of call it is instead.
+		first = strings.TrimSpace(syscallLabel(tk.Syscall.Name, tk.Syscall.Args))
 	}
-	return "perform an action"
+	return first, strings.TrimSpace(rest)
 }
 
-// approvalBlocks builds the Block Kit layout for an approval prompt: a summary
-// section and the Approve/Deny buttons carrying value.
+// approvalBlocks builds the Block Kit layout for an approval prompt: what the
+// bot wants to do, the exact call, when the request expires, and the buttons.
 func approvalBlocks(tk Task, value string) []map[string]any {
-	text := "🔐 *Approval needed* — the duty bot wants to " + approvalSummary(tk)
-	if tk.Syscall.Name != "" {
-		text += "\n• syscall: `" + tk.Syscall.Name + "`"
-	}
-	if snippet := argsSnippet(tk.Syscall.Args); snippet != "" {
-		text += "\n• args: `" + snippet + "`"
-	}
-	if tk.ExpiresAt != nil {
-		text += "\n• expires: " + tk.ExpiresAt.UTC().Format(time.RFC3339)
-	}
-	return []map[string]any{
-		{
+	headline, details := approvalParts(tk)
+	blocks := []map[string]any{{
+		"type": "section",
+		"text": map[string]any{"type": "mrkdwn", "text": "🔐 *Approval needed:* " + escapeMrkdwn(headline)},
+	}}
+	if details != "" {
+		blocks = append(blocks, map[string]any{
 			"type": "section",
-			"text": map[string]any{"type": "mrkdwn", "text": text},
-		},
-		{
+			"text": map[string]any{"type": "mrkdwn", "text": "```" + escapeMrkdwn(truncate(details, 2500)) + "```"},
+		})
+	}
+	footer := "`" + escapeMrkdwn(tk.Syscall.Name) + "`"
+	if tk.ExpiresAt != nil {
+		footer += fmt.Sprintf(" · expires <!date^%d^{date_short_pretty} at {time}|%s>",
+			tk.ExpiresAt.Unix(), tk.ExpiresAt.UTC().Format(time.RFC3339))
+	}
+	blocks = append(blocks,
+		map[string]any{"type": "context", "elements": []map[string]any{{"type": "mrkdwn", "text": footer}}},
+		map[string]any{
 			"type":     "actions",
 			"block_id": "duty_approval",
 			"elements": []map[string]any{
@@ -85,7 +102,8 @@ func approvalBlocks(tk Task, value string) []map[string]any {
 				button(actionDeny, "Deny", "danger", value),
 			},
 		},
-	}
+	)
+	return blocks
 }
 
 func button(actionID, label, style, value string) map[string]any {
@@ -98,16 +116,12 @@ func button(actionID, label, style, value string) map[string]any {
 	}
 }
 
-// argsSnippet renders a bounded, single-line view of a syscall's args for the
-// prompt (the decision-relevant content of an approval — the URL being fetched,
-// the value being written). Backticks are dropped so the guest's args can't
-// break out of the surrounding mrkdwn code span.
-func argsSnippet(raw json.RawMessage) string {
-	s := strings.ReplaceAll(collapseSpaces(string(raw)), "`", "'")
-	if s == "" || s == "null" {
-		return ""
-	}
-	return truncate(s, 300)
+// escapeMrkdwn escapes the three characters Slack's mrkdwn treats as control,
+// so text from a call's arguments cannot form a link or ping the channel, and
+// keeps a code block closed.
+func escapeMrkdwn(s string) string {
+	s = strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;").Replace(s)
+	return strings.ReplaceAll(s, "```", "'''")
 }
 
 // --- interactions endpoint ---
@@ -174,21 +188,30 @@ func (c *Connector) handleInteraction(p interactionPayload) {
 	if p.Channel.ID != c.cfg.ChannelID {
 		return
 	}
-	var decision string
-	switch p.Actions[0].ActionID {
-	case actionApprove:
-		decision = DecisionApproved
-	case actionDeny:
-		decision = DecisionDenied
-	default:
-		return
-	}
 	var v buttonValue
 	if err := json.Unmarshal([]byte(p.Actions[0].Value), &v); err != nil {
 		c.logger.Warn("decode button value", "error", err)
 		return
 	}
-	c.resolveApproval(p, v, decision)
+	switch p.Actions[0].ActionID {
+	case actionApprove:
+		c.resolveApproval(p, v, DecisionApproved)
+	case actionDeny:
+		c.resolveApproval(p, v, DecisionDenied)
+	case actionRetry:
+		c.requestRetry(p, v)
+	}
+}
+
+// requestRetry hands an interrupted process to its thread's worker, which
+// resumes it and follows it to its outcome. The notice loses its button, so a
+// second click cannot queue a second retry.
+func (c *Connector) requestRetry(p interactionPayload, v buttonValue) {
+	if v.Process == "" || v.Thread == "" {
+		return
+	}
+	c.updatePrompt(c.ctx, p, fmt.Sprintf("🔁 Retry requested by <@%s>.", p.User.ID))
+	c.startWorker(v.Thread, v.Session, work{retryID: v.Process})
 }
 
 // resolveApproval re-reads the task from the session log (for its current state
@@ -196,9 +219,6 @@ func (c *Connector) handleInteraction(p interactionPayload) {
 // message to reflect the outcome — removing the buttons either way.
 func (c *Connector) resolveApproval(p interactionPayload, v buttonValue, decision string) {
 	ctx := c.ctx
-	if ctx == nil {
-		ctx = context.Background()
-	}
 	log, err := c.aurora.GetSessionLog(ctx, v.Session)
 	if err != nil {
 		c.logger.Warn("interaction: fetch session log", "session", v.Session, "error", err)
@@ -210,8 +230,9 @@ func (c *Connector) resolveApproval(p interactionPayload, v buttonValue, decisio
 		c.updatePrompt(ctx, p, "⚠️ This approval is no longer available.")
 		return
 	}
+	headline, _ := approvalParts(*tk)
 	if tk.State != TaskPending {
-		c.updatePrompt(ctx, p, fmt.Sprintf("ℹ️ Already %s — %s", tk.State, approvalSummary(*tk)))
+		c.updatePrompt(ctx, p, fmt.Sprintf("ℹ️ Already %s: %s", tk.State, escapeMrkdwn(headline)))
 		return
 	}
 	actor := slackActor(p)
@@ -230,7 +251,7 @@ func (c *Connector) resolveApproval(p interactionPayload, v buttonValue, decisio
 	if decision == DecisionDenied {
 		verb = "🚫 Denied"
 	}
-	c.updatePrompt(ctx, p, fmt.Sprintf("%s by <@%s> — %s", verb, p.User.ID, approvalSummary(*tk)))
+	c.updatePrompt(ctx, p, fmt.Sprintf("%s by <@%s>: %s", verb, p.User.ID, escapeMrkdwn(headline)))
 }
 
 // updatePrompt rewrites the prompt message to plain text, which also strips its

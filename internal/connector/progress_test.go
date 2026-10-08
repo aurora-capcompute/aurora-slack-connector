@@ -22,7 +22,7 @@ func TestBuildTimelineCollapsesAndDropsHousekeeping(t *testing.T) {
 	if len(steps) != 4 {
 		t.Fatalf("got %d steps, want 4: %+v", len(steps), steps)
 	}
-	if steps[1].label != syscallLabel("core.openaiApi") || steps[1].count != 2 {
+	if steps[1].label != syscallLabel("core.openaiApi", nil) || steps[1].count != 2 {
 		t.Fatalf("thinking step not collapsed: %+v", steps[1])
 	}
 	// Only the final step, and only while running, may be active.
@@ -53,14 +53,14 @@ func TestRenderStatusIncludesHeaderAndTimeline(t *testing.T) {
 	if want := "HEAD"; got[:len(want)] != want {
 		t.Fatalf("missing header: %q", got)
 	}
-	if !contains(got, "querying the internet") {
+	if !contains(got, "Reading the web") {
 		t.Fatalf("missing internet step: %q", got)
 	}
 }
 
 func TestRenderStatusCapsSteps(t *testing.T) {
 	var entries []JournalEntry
-	names := []string{"core.internet", "core.memory", "core.openaiApi"}
+	names := []string{"core.internet", "core.scratch", "core.openaiApi"}
 	for i := 0; i < 40; i++ {
 		entries = append(entries, entry(names[i%len(names)], "result"))
 	}

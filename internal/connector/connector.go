@@ -49,11 +49,18 @@ type Connector struct {
 }
 
 // thread is one Slack thread's live state: the aurora session serving it and a
-// mailbox its worker goroutine drains one message at a time.
+// mailbox its worker goroutine drains one item at a time.
 type thread struct {
 	threadTS  string
 	sessionID string
-	inbox     chan string
+	inbox     chan work
+}
+
+// work is one item for a thread's worker: a user message to run as a new
+// process, or an interrupted process to retry.
+type work struct {
+	text    string
+	retryID string
 }
 
 // New builds a Connector from config and its two clients.
@@ -219,7 +226,7 @@ func (c *Connector) deliver(threadTS, text string, trigger, isReply bool) {
 	// Fast path: a live worker already serves this thread.
 	c.mu.Lock()
 	if t, ok := c.threads[threadTS]; ok {
-		t.submit(text, c.logger)
+		t.submit(work{text: text}, c.logger)
 		c.mu.Unlock()
 		return
 	}
@@ -240,7 +247,7 @@ func (c *Connector) deliver(threadTS, text string, trigger, isReply bool) {
 		if sessionID == "" {
 			return
 		}
-		c.startWorker(threadTS, sessionID, text)
+		c.startWorker(threadTS, sessionID, work{text: text})
 		return
 	}
 
@@ -258,32 +265,32 @@ func (c *Connector) deliver(threadTS, text string, trigger, isReply bool) {
 		}
 		return
 	}
-	c.startWorker(threadTS, sessionID, text)
+	c.startWorker(threadTS, sessionID, work{text: text})
 }
 
-// startWorker registers a thread and launches its worker, or hands the message
-// to an existing worker if one raced into place.
-func (c *Connector) startWorker(threadTS, sessionID, firstText string) {
+// startWorker registers a thread and launches its worker, or hands the item to
+// an existing worker if one raced into place.
+func (c *Connector) startWorker(threadTS, sessionID string, first work) {
 	c.mu.Lock()
 	if t, ok := c.threads[threadTS]; ok {
-		t.submit(firstText, c.logger)
+		t.submit(first, c.logger)
 		c.mu.Unlock()
 		return
 	}
-	t := &thread{threadTS: threadTS, sessionID: sessionID, inbox: make(chan string, inboxBuffer)}
+	t := &thread{threadTS: threadTS, sessionID: sessionID, inbox: make(chan work, inboxBuffer)}
 	c.threads[threadTS] = t
-	t.submit(firstText, c.logger)
+	t.submit(first, c.logger)
 	c.mu.Unlock()
 
 	c.logger.Info("serving thread", "thread", threadTS, "session", sessionID)
 	go c.runThread(t)
 }
 
-// submit enqueues a message for the worker without blocking the caller; a full
-// mailbox drops the message with a warning rather than stalling event handling.
-func (t *thread) submit(text string, logger *slog.Logger) {
+// submit enqueues an item for the worker without blocking the caller; a full
+// mailbox drops the item with a warning rather than stalling event handling.
+func (t *thread) submit(w work, logger *slog.Logger) {
 	select {
-	case t.inbox <- text:
+	case t.inbox <- w:
 	default:
 		logger.Warn("thread inbox full; dropping message", "thread", t.threadTS)
 	}
@@ -297,9 +304,13 @@ func (c *Connector) runThread(t *thread) {
 	defer idle.Stop()
 	for {
 		select {
-		case text := <-t.inbox:
+		case w := <-t.inbox:
 			resetTimer(idle, idleTimeout)
-			c.handleMessage(c.ctx, t, text)
+			if w.retryID != "" {
+				c.handleRetry(c.ctx, t, w.retryID)
+			} else {
+				c.handleMessage(c.ctx, t, w.text)
+			}
 		case <-idle.C:
 			// Retire only when nothing is queued, under the lock so a concurrent
 			// submit cannot be lost to a dead worker.
@@ -337,6 +348,20 @@ func (c *Connector) handleMessage(ctx context.Context, t *thread, text string) {
 		return
 	}
 	c.pollProcess(ctx, t, proc.ID, statusTS)
+}
+
+// handleRetry resumes an interrupted process and follows it to its outcome, like
+// a new message.
+func (c *Connector) handleRetry(ctx context.Context, t *thread, processID string) {
+	statusTS, err := c.slack.PostMessage(ctx, c.cfg.ChannelID, t.threadTS, statusHeader(StatusQueued, false))
+	if err != nil {
+		c.logger.Warn("post status message", "thread", t.threadTS, "error", err)
+	}
+	if _, err := c.aurora.Retry(ctx, processID); err != nil {
+		c.report(ctx, t, statusTS, "❌ I couldn't retry the investigation: "+oneLine(err.Error()))
+		return
+	}
+	c.pollProcess(ctx, t, processID, statusTS)
 }
 
 // spawn creates the process, tolerating a transient "session already has an
@@ -481,13 +506,34 @@ func (c *Connector) postOutcome(ctx context.Context, t *thread, snap ProcessSnap
 		msg = "❌ The investigation failed: " + oneLine(snap.Error)
 	case StatusStopped:
 		msg = "🛑 The investigation was stopped."
-	case StatusCompensated:
-		msg = "↩️ The investigation was rolled back: " + oneLine(snap.Error)
+	case StatusInterrupted:
+		c.postInterrupted(ctx, t, snap)
+		return
 	default:
 		return
 	}
 	if _, err := c.slack.PostMessage(ctx, c.cfg.ChannelID, t.threadTS, msg); err != nil {
 		c.logger.Warn("post outcome", "thread", t.threadTS, "error", err)
+	}
+}
+
+// postInterrupted says that a process stopped before it finished, and offers a
+// Retry button that resumes it where its journal stopped.
+func (c *Connector) postInterrupted(ctx context.Context, t *thread, snap ProcessSnapshot) {
+	text := "⏸️ The investigation stopped before it finished: it ran past the server's time limit, or the server restarted. Retry continues from where it stopped."
+	value, err := json.Marshal(buttonValue{Process: snap.ID, Session: t.sessionID, Thread: t.threadTS})
+	if err != nil {
+		c.logger.Warn("encode retry button", "process", snap.ID, "error", err)
+		return
+	}
+	blocks := []map[string]any{
+		{"type": "section", "text": map[string]any{"type": "mrkdwn", "text": text}},
+		{"type": "actions", "block_id": "duty_retry", "elements": []map[string]any{
+			button(actionRetry, "Retry", "primary", string(value)),
+		}},
+	}
+	if _, err := c.slack.PostBlockMessage(ctx, c.cfg.ChannelID, t.threadTS, text, blocks); err != nil {
+		c.logger.Warn("post interrupted notice", "thread", t.threadTS, "error", err)
 	}
 }
 
@@ -546,8 +592,8 @@ func statusHeader(status string, awaitingApproval bool) string {
 		return "❌ *Duty bot — failed*"
 	case StatusStopped:
 		return "🛑 *Duty bot — stopped*"
-	case StatusCompensated:
-		return "↩️ *Duty bot — rolled back*"
+	case StatusInterrupted:
+		return "⏸️ *Duty bot — interrupted*"
 	case StatusWaitingTask:
 		return "🛎️ *Duty bot — working* _(waiting on a timer)_"
 	default:

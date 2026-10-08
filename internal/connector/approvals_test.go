@@ -26,7 +26,7 @@ func TestNeedsHumanDecision(t *testing.T) {
 	if mk("sys.timer", TaskPending).NeedsHumanDecision() {
 		t.Error("a pending timer resolves itself; no human needed")
 	}
-	if mk("core.internet", TaskApproved).NeedsHumanDecision() {
+	if mk("core.internet", "approved").NeedsHumanDecision() {
 		t.Error("a resolved task needs no human")
 	}
 }

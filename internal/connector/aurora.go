@@ -12,12 +12,11 @@ import (
 	"time"
 )
 
-// AuroraClient is a thin client for a local aurora-dist instance — the single
-// HTTP way into the runtime, versioned /v1. The connector only ever needs four
-// calls: create a session (one per Slack thread), start a process (one per user
-// message — the "aurora spawn"), poll a process for its status, and read the
-// session log for the journal (the syscalls a process is running). Everything
-// else the API offers is out of scope here.
+// AuroraClient is a thin client for an aurora-dist instance — the single HTTP
+// way into the runtime, versioned /v1. The connector needs a few calls: create
+// or find a session (one per Slack thread), start a process (one per user
+// message), poll a process, read the session log (the journal and tasks),
+// resolve a task, and retry an interrupted process.
 //
 // We mirror only the response fields we use rather than importing the
 // aurora-dist module: the connector talks to the runtime purely over HTTP+JSON,
@@ -40,26 +39,23 @@ func NewAuroraClient(baseURL string, timeout time.Duration) *AuroraClient {
 	}
 }
 
-// Process statuses, mirrored from aurora's agent.ProcessStatus. The terminal
-// set ends a poll; everything else means "still working".
+// Process statuses, mirrored from aurora's durable.ProcessStatus.
 const (
 	StatusQueued      = "queued"
 	StatusRunning     = "running"
-	StatusStopping    = "stopping"
-	StatusYielded     = "yielded"
 	StatusWaitingTask = "waiting_for_task"
 	StatusInterrupted = "interrupted"
 	StatusCompleted   = "completed"
 	StatusStopped     = "stopped"
 	StatusFailed      = "failed"
-	StatusCompensated = "compensated"
 )
 
-// IsTerminal reports whether a process status is final — the process will not
-// advance further, so polling can stop.
+// IsTerminal reports whether a process will not advance on its own, so polling
+// can stop. An interrupted process (past the server's time limit, or cut off by
+// a restart) waits for a retry.
 func IsTerminal(status string) bool {
 	switch status {
-	case StatusCompleted, StatusStopped, StatusFailed, StatusCompensated:
+	case StatusCompleted, StatusStopped, StatusFailed, StatusInterrupted:
 		return true
 	default:
 		return false
@@ -103,19 +99,10 @@ type ProcessLog struct {
 	Tasks         []Task         `json:"tasks"`
 }
 
-// Task states, mirrored from aurora's task.State (= sys.Decision). A pending
-// task is one awaiting resolution; a human-approvable one parks the process in
-// waiting_for_task until POST /v1/tasks/{id}/resolve settles it.
-const (
-	TaskPending   = "pending"
-	TaskApproved  = "approved"
-	TaskCompleted = "completed"
-	TaskDenied    = "denied"
-	TaskFailed    = "failed"
-	TaskCancelled = "cancelled"
-	TaskExpired   = "expired"
-	TaskExecuted  = "executed"
-)
+// TaskPending is the state of a task that awaits resolution. A pending
+// approval parks its process in waiting_for_task until
+// POST /v1/tasks/{id}/resolve settles it.
+const TaskPending = "pending"
 
 // Resolution decisions accepted by POST /v1/tasks/{id}/resolve. For a duty bot's
 // human-in-the-loop approvals only two matter: approve lets the syscall proceed,
@@ -156,7 +143,8 @@ type JournalEntry struct {
 	Position int    `json:"position"`
 	Revision uint64 `json:"revision"`
 	Syscall  struct {
-		Name string `json:"name"`
+		Name string          `json:"name"`
+		Args json.RawMessage `json:"args,omitempty"`
 	} `json:"syscall"`
 	Outcome struct {
 		Status  string `json:"status"`
@@ -327,6 +315,13 @@ func (c *AuroraClient) ResolveTask(ctx context.Context, taskID, token, decision,
 	}
 	var out Task
 	err := c.do(ctx, http.MethodPost, "/v1/tasks/"+taskID+"/resolve", body, &out)
+	return out, err
+}
+
+// Retry resumes an interrupted process from where its journal stopped.
+func (c *AuroraClient) Retry(ctx context.Context, processID string) (ProcessSnapshot, error) {
+	var out ProcessSnapshot
+	err := c.do(ctx, http.MethodPost, "/v1/processes/"+processID+"/retry", map[string]any{"mode": "resume"}, &out)
 	return out, err
 }
 
