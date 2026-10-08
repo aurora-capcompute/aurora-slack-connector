@@ -105,35 +105,9 @@ A duration is a Go duration (`2s`, `10m`) or a number of seconds.
 
 ### The manifest
 
-The connector sends the manifest to Aurora unchanged. A start for an
-information-gathering bot:
-
-```json
-{
-  "version": 4,
-  "program": "agent",
-  "syscalls": [
-    {
-      "syscall": "core.openaiApi",
-      "hidden": true,
-      "base_url": "https://api.openai.com/v1",
-      "api_key": {"secret": "OPENAI_KEY"},
-      "default_model": "gpt-4o",
-      "capabilities": [{"operation": "chat", "require_approval": false}]
-    },
-    {
-      "syscall": "core.internet",
-      "capabilities": [{"methods": ["GET"], "domain": "status.example.com"}]
-    },
-    {"syscall": "core.scratch", "capabilities": [{"operation": "get"}, {"operation": "put"}]},
-    {"syscall": "sys.timer"}
-  ]
-}
-```
-
-`api_key` names a secret that aurora-dist resolves from
-`AURORA_SECRET_OPENAI_KEY`. Aurora refuses an inline key. Set
-`require_approval: true` on every capability that changes something (for
+The connector sends the manifest to Aurora unchanged. Start from the minimal
+manifest in the [aurora-dist README](https://github.com/aurora-capcompute/aurora-dist).
+Set `require_approval: true` on every capability that changes something (for
 example a `POST` to an internal endpoint). A Slack message is untrusted input,
 so a gated call needs a human. Read-only lookups can stay ungated.
 
