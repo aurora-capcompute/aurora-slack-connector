@@ -39,7 +39,10 @@ func syscallLabel(name string, args json.RawMessage) string {
 	case "core.command":
 		return "🖥️ Running " + orDefault(call.Operation, "a command")
 	case "core.scratch":
-		if call.Operation == "put" {
+		switch call.Operation {
+		case "store":
+			return "" // the agent saves every tool result: housekeeping
+		case "put":
 			return "🗒️ Saving notes"
 		}
 		return "🗒️ Checking notes"

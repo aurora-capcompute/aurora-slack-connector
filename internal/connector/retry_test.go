@@ -175,4 +175,8 @@ func TestSyscallLabelsNameTheWork(t *testing.T) {
 			t.Errorf("syscallLabel(%s, %s) = %q, want %q", c.name, c.args, got, want)
 		}
 	}
+	// The agent saves every tool result; the save is not a step of the work.
+	if got := syscallLabel("core.scratch", json.RawMessage(`{"operation":"store","value":{}}`)); got != "" {
+		t.Errorf("an automatic save is labelled %q, want it hidden", got)
+	}
 }
