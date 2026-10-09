@@ -43,10 +43,11 @@ and in the manifest you give it.
   status.example.com`, `🔌 Calling search_onyx`, `🖥️ Running kubectl-get`.
   A `…` marks the call in progress. Savepoints and other housekeeping calls
   are not shown. Then it posts the answer as a new message.
-- **Interrupted runs.** A run can stop before it finishes: past the server's
-  time limit (`quantum_deadline_seconds`), or cut off by a restart. The
-  connector says so in the thread and posts a **Retry** button. A click resumes
-  the run where its journal stopped.
+- **Interrupted and failed runs.** A run can stop before it finishes: past the
+  server's time limit (`quantum_deadline_seconds`), or cut off by a restart. It
+  can also fail, for example when an LLM call still fails after the driver's
+  retries. The connector says so in the thread and posts a **Retry** button. A
+  click resumes the run where its journal stopped.
 
 ## Approvals
 

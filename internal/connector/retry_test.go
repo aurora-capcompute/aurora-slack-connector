@@ -11,8 +11,8 @@ import (
 	"time"
 )
 
-// retryAurora is a stub whose process is interrupted until it is retried, and
-// then completes.
+// retryAurora is a stub whose process ends with status (interrupted or failed)
+// until it is retried, and then completes.
 type retryAurora struct {
 	server  *httptest.Server
 	mu      sync.Mutex
@@ -20,7 +20,7 @@ type retryAurora struct {
 	retryCh chan struct{}
 }
 
-func newRetryAurora() *retryAurora {
+func newRetryAurora(status string) *retryAurora {
 	s := &retryAurora{retryCh: make(chan struct{}, 4)}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/sessions", func(w http.ResponseWriter, _ *http.Request) {
@@ -36,7 +36,7 @@ func newRetryAurora() *retryAurora {
 			_, _ = w.Write([]byte(`{"id":"proc_1","status":"completed","answer":"Recovered answer.","journal_length":3}`))
 			return
 		}
-		_, _ = w.Write([]byte(`{"id":"proc_1","status":"interrupted","error":"context deadline exceeded","journal_length":2}`))
+		_, _ = w.Write([]byte(`{"id":"proc_1","status":"` + status + `","error":"context deadline exceeded","journal_length":2}`))
 	})
 	mux.HandleFunc("GET /v1/sessions/{id}", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`{"session":{"id":"ses_1"},"processes":[{"id":"proc_1","entries":[{"position":0,"syscall":{"name":"sys.input"},"outcome":{"status":"result"}}]}]}`))
@@ -60,69 +60,77 @@ func newRetryAurora() *retryAurora {
 	return s
 }
 
-// An interrupted process is an end for the thread: the connector says so and
-// offers a Retry button. A click resumes the process, and its answer arrives.
-func TestInterruptedProcessOffersRetry(t *testing.T) {
-	a := newRetryAurora()
-	defer a.server.Close()
-	sl := newHITLSlack()
-	defer sl.close()
+// An interrupted or failed process is an end for the thread: the connector says
+// so and offers a Retry button. A click resumes the process, and its answer
+// arrives.
+func TestEndedProcessOffersRetry(t *testing.T) {
+	for _, c := range []struct{ status, notice string }{
+		{StatusInterrupted, "stopped before it finished"},
+		{StatusFailed, "investigation failed"},
+	} {
+		t.Run(c.status, func(t *testing.T) {
+			a := newRetryAurora(c.status)
+			defer a.server.Close()
+			sl := newHITLSlack()
+			defer sl.close()
 
-	cfg := Config{
-		ChannelID:      "C1",
-		TriggerKeyword: "@duty",
-		Manifest:       json.RawMessage(`{"version":4}`),
-		PollInterval:   5 * time.Millisecond,
-		ProcessTimeout: 5 * time.Second,
-		HTTPTimeout:    2 * time.Second,
-	}
-	slack := NewSlackClient("xoxb-test", cfg.HTTPTimeout)
-	slack.baseURL = sl.server.URL
-	conn := New(cfg, NewAuroraClient(a.server.URL, cfg.HTTPTimeout), slack, discardLogger())
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	conn.Start(ctx)
-
-	conn.dispatchEvent(mentionEvent("U1", "<@UBOT> @duty dig into the outage", "100.1", ""))
-
-	var noticeTS string
-	deadline := time.After(3 * time.Second)
-	for noticeTS == "" {
-		select {
-		case p := <-sl.postCh:
-			if p.hasBlocks && strings.Contains(p.text, "stopped before it finished") {
-				noticeTS = p.ts
+			cfg := Config{
+				ChannelID:      "C1",
+				TriggerKeyword: "@duty",
+				Manifest:       json.RawMessage(`{"version":4}`),
+				PollInterval:   5 * time.Millisecond,
+				ProcessTimeout: 5 * time.Second,
+				HTTPTimeout:    2 * time.Second,
 			}
-		case <-deadline:
-			t.Fatal("no interrupted notice with a Retry button was posted")
-		}
-	}
+			slack := NewSlackClient("xoxb-test", cfg.HTTPTimeout)
+			slack.baseURL = sl.server.URL
+			conn := New(cfg, NewAuroraClient(a.server.URL, cfg.HTTPTimeout), slack, discardLogger())
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			conn.Start(ctx)
 
-	value, _ := json.Marshal(buttonValue{Process: "proc_1", Session: "ses_1", Thread: "100.1"})
-	payload, _ := json.Marshal(map[string]any{
-		"type":    "block_actions",
-		"user":    map[string]any{"id": "U1"},
-		"channel": map[string]any{"id": "C1"},
-		"message": map[string]any{"ts": noticeTS},
-		"actions": []any{map[string]any{"action_id": actionRetry, "value": string(value)}},
-	})
-	conn.route(socketMessage{Type: "interactive", EnvelopeID: "env1", Payload: payload})
+			conn.dispatchEvent(mentionEvent("U1", "<@UBOT> @duty dig into the outage", "100.1", ""))
 
-	select {
-	case <-a.retryCh:
-	case <-time.After(3 * time.Second):
-		t.Fatal("the process was never retried")
-	}
-	deadline = time.After(3 * time.Second)
-	for {
-		select {
-		case p := <-sl.postCh:
-			if strings.Contains(p.text, "Recovered answer.") {
-				return
+			var noticeTS string
+			deadline := time.After(3 * time.Second)
+			for noticeTS == "" {
+				select {
+				case p := <-sl.postCh:
+					if p.hasBlocks && strings.Contains(p.text, c.notice) {
+						noticeTS = p.ts
+					}
+				case <-deadline:
+					t.Fatal("no interrupted notice with a Retry button was posted")
+				}
 			}
-		case <-deadline:
-			t.Fatal("the retried process's answer was not posted")
-		}
+
+			value, _ := json.Marshal(buttonValue{Process: "proc_1", Session: "ses_1", Thread: "100.1"})
+			payload, _ := json.Marshal(map[string]any{
+				"type":    "block_actions",
+				"user":    map[string]any{"id": "U1"},
+				"channel": map[string]any{"id": "C1"},
+				"message": map[string]any{"ts": noticeTS},
+				"actions": []any{map[string]any{"action_id": actionRetry, "value": string(value)}},
+			})
+			conn.route(socketMessage{Type: "interactive", EnvelopeID: "env1", Payload: payload})
+
+			select {
+			case <-a.retryCh:
+			case <-time.After(3 * time.Second):
+				t.Fatal("the process was never retried")
+			}
+			deadline = time.After(3 * time.Second)
+			for {
+				select {
+				case p := <-sl.postCh:
+					if strings.Contains(p.text, "Recovered answer.") {
+						return
+					}
+				case <-deadline:
+					t.Fatal("the retried process's answer was not posted")
+				}
+			}
+		})
 	}
 }
 

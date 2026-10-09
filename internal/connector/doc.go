@@ -18,8 +18,8 @@
 //     Approve/Deny buttons; a click is resolved through
 //     POST /v1/tasks/{id}/resolve, and the parked process resumes.
 //   - When a process is interrupted (past the server's time limit, or cut off
-//     by a restart), the connector says so and posts a Retry button; a click
-//     resumes the process through POST /v1/processes/{id}/retry.
+//     by a restart) or fails, the connector says so and posts a Retry button;
+//     a click resumes the process through POST /v1/processes/{id}/retry.
 //
 // The connector holds no secrets of its own beyond the Slack credentials: the
 // LLM endpoint and the capability grants live in the operator-supplied aurora

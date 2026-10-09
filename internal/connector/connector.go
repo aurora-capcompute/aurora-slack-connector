@@ -454,11 +454,14 @@ func (c *Connector) postOutcome(ctx context.Context, t *thread, snap ProcessSnap
 			msg = "✅ Done — but the investigation returned no written answer."
 		}
 	case StatusFailed:
-		msg = "❌ The investigation failed: " + oneLine(snap.Error)
+		// A failed LLM call leaves its section open, so a resume calls the LLM
+		// again: offer the retry here too.
+		c.postWithRetry(ctx, t, snap, "❌ The investigation failed: "+oneLine(snap.Error)+". Retry resumes it.")
+		return
 	case StatusStopped:
 		msg = "🛑 The investigation was stopped."
 	case StatusInterrupted:
-		c.postInterrupted(ctx, t, snap)
+		c.postWithRetry(ctx, t, snap, "⏸️ The investigation stopped before it finished: it ran past the server's time limit, or the server restarted. Retry continues from where it stopped.")
 		return
 	default:
 		return
@@ -468,10 +471,9 @@ func (c *Connector) postOutcome(ctx context.Context, t *thread, snap ProcessSnap
 	}
 }
 
-// postInterrupted says that a process stopped before it finished, and offers a
-// Retry button that resumes it where its journal stopped.
-func (c *Connector) postInterrupted(ctx context.Context, t *thread, snap ProcessSnapshot) {
-	text := "⏸️ The investigation stopped before it finished: it ran past the server's time limit, or the server restarted. Retry continues from where it stopped."
+// postWithRetry posts text about a process that ended without an answer, with
+// a Retry button that resumes the process.
+func (c *Connector) postWithRetry(ctx context.Context, t *thread, snap ProcessSnapshot, text string) {
 	value, err := json.Marshal(buttonValue{Process: snap.ID, Session: t.sessionID, Thread: t.threadTS})
 	if err != nil {
 		c.logger.Warn("encode retry button", "process", snap.ID, "error", err)
@@ -484,7 +486,7 @@ func (c *Connector) postInterrupted(ctx context.Context, t *thread, snap Process
 		}},
 	}
 	if _, err := c.slack.PostBlockMessage(ctx, c.cfg.ChannelID, t.threadTS, text, blocks); err != nil {
-		c.logger.Warn("post interrupted notice", "thread", t.threadTS, "error", err)
+		c.logger.Warn("post retry notice", "thread", t.threadTS, "error", err)
 	}
 }
 
