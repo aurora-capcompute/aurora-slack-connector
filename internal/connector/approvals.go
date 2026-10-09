@@ -36,11 +36,7 @@ type buttonValue struct {
 
 // postApprovalPrompt posts one interactive approval request for a pending task.
 func (c *Connector) postApprovalPrompt(ctx context.Context, t *thread, tk Task) {
-	value, err := json.Marshal(buttonValue{Task: tk.ID, Session: t.sessionID})
-	if err != nil {
-		c.logger.Warn("encode approval button", "task", tk.ID, "error", err)
-		return
-	}
+	value, _ := json.Marshal(buttonValue{Task: tk.ID, Session: t.sessionID})
 	headline, _ := approvalParts(tk)
 	fallback := "Approval needed: " + escapeMrkdwn(headline)
 	ts, err := c.slack.PostBlockMessage(ctx, c.cfg.ChannelID, t.threadTS, fallback, approvalBlocks(tk, string(value)))

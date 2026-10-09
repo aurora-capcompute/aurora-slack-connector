@@ -10,14 +10,11 @@ type seenSet struct {
 	mu    sync.Mutex
 	set   map[string]struct{}
 	order []string
-	max   int
+	limit int
 }
 
-func newSeenSet(max int) *seenSet {
-	if max <= 0 {
-		max = 1024
-	}
-	return &seenSet{set: make(map[string]struct{}, max), max: max}
+func newSeenSet(limit int) *seenSet {
+	return &seenSet{set: make(map[string]struct{}, limit), limit: limit}
 }
 
 // add records a key and reports whether it was new (true) or a duplicate
@@ -30,7 +27,7 @@ func (s *seenSet) add(key string) bool {
 	}
 	s.set[key] = struct{}{}
 	s.order = append(s.order, key)
-	if len(s.order) > s.max {
+	if len(s.order) > s.limit {
 		oldest := s.order[0]
 		s.order = s.order[1:]
 		delete(s.set, oldest)

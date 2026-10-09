@@ -1,6 +1,7 @@
 package connector
 
 import (
+	"cmp"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -31,8 +32,8 @@ type Config struct {
 	// empty; used to strip the leading mention from a message and to ignore the
 	// bot's own posts.
 	BotUserID string
-	// SlackAPIBaseURL overrides the Slack Web API base (default
-	// https://slack.com/api) — for an enterprise gateway or local testing.
+	// SlackAPIBaseURL is the Slack Web API base (default https://slack.com/api),
+	// overridable for an enterprise gateway or local testing.
 	SlackAPIBaseURL string
 
 	// --- Aurora ---
@@ -64,12 +65,8 @@ func LoadConfig() (Config, error) {
 		SlackAppToken:   strings.TrimSpace(os.Getenv("SLACK_APP_TOKEN")),
 		ChannelID:       strings.TrimSpace(os.Getenv("SLACK_CHANNEL_ID")),
 		BotUserID:       strings.TrimSpace(os.Getenv("SLACK_BOT_USER_ID")),
-		SlackAPIBaseURL: strings.TrimSpace(os.Getenv("SLACK_API_BASE_URL")),
-		AuroraBaseURL:   strings.TrimSpace(os.Getenv("AURORA_BASE_URL")),
-	}
-
-	if cfg.AuroraBaseURL == "" {
-		cfg.AuroraBaseURL = "http://localhost:8080"
+		SlackAPIBaseURL: cmp.Or(strings.TrimSpace(os.Getenv("SLACK_API_BASE_URL")), "https://slack.com/api"),
+		AuroraBaseURL:   cmp.Or(strings.TrimSpace(os.Getenv("AURORA_BASE_URL")), "http://localhost:8080"),
 	}
 
 	var err error
@@ -116,10 +113,7 @@ func loadManifest() (json.RawMessage, error) {
 	}
 	// Re-marshal to a compact canonical form so it travels cleanly in the
 	// process-create request body.
-	compact, err := json.Marshal(probe)
-	if err != nil {
-		return nil, fmt.Errorf("canonicalize manifest: %w", err)
-	}
+	compact, _ := json.Marshal(probe)
 	return compact, nil
 }
 
@@ -154,6 +148,8 @@ func (c Config) Validate() error {
 		return fmt.Errorf("POLL_INTERVAL must be positive")
 	case c.ProcessTimeout <= 0:
 		return fmt.Errorf("PROCESS_TIMEOUT must be positive")
+	case c.HTTPTimeout <= 0:
+		return fmt.Errorf("HTTP_TIMEOUT must be positive")
 	}
 	return nil
 }

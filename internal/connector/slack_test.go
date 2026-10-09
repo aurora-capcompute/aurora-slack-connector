@@ -42,8 +42,7 @@ func TestSlackClientCalls(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewSlackClient("xoxb-test", time.Second)
-	c.baseURL = srv.URL
+	c := NewSlackClient("xoxb-test", srv.URL, time.Second)
 	ctx := context.Background()
 
 	id, err := c.AuthTest(ctx)
@@ -67,8 +66,7 @@ func TestSlackClientErrorResponse(t *testing.T) {
 		_, _ = w.Write([]byte(`{"ok":false,"error":"channel_not_found"}`))
 	}))
 	defer srv.Close()
-	c := NewSlackClient("xoxb-test", time.Second)
-	c.baseURL = srv.URL
+	c := NewSlackClient("xoxb-test", srv.URL, time.Second)
 	if _, err := c.PostMessage(context.Background(), "C1", "T1", "hi"); err == nil {
 		t.Fatal("expected error from ok:false response")
 	}

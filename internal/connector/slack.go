@@ -15,32 +15,21 @@ import (
 // SlackClient calls the Slack Web API: auth.test to learn the bot's identity at
 // startup, chat.postMessage / chat.update to speak in a thread,
 // conversations.replies to read a thread, and apps.connections.open to start a
-// Socket Mode connection. Just enough of the
-// API for a single-channel duty bot, over the standard library — no SDK.
+// Socket Mode connection. Just enough of the API for a single-channel duty bot,
+// over the standard library — no SDK.
 type SlackClient struct {
 	token   string
-	baseURL string // https://slack.com/api, overridable in tests
+	baseURL string
 	http    *http.Client
 }
 
-// NewSlackClient builds a client for the given bot token (xoxb-...).
-func NewSlackClient(token string, timeout time.Duration) *SlackClient {
-	if timeout <= 0 {
-		timeout = 30 * time.Second
-	}
+// NewSlackClient builds a client for the given bot token (xoxb-...) and Web API
+// base URL. timeout bounds each request.
+func NewSlackClient(token, baseURL string, timeout time.Duration) *SlackClient {
 	return &SlackClient{
 		token:   token,
-		baseURL: "https://slack.com/api",
+		baseURL: strings.TrimRight(baseURL, "/"),
 		http:    &http.Client{Timeout: timeout},
-	}
-}
-
-// SetAPIBaseURL overrides the Slack Web API base (default https://slack.com/api).
-// Useful for an enterprise Slack gateway or a local test double; empty is
-// ignored so the default stands.
-func (c *SlackClient) SetAPIBaseURL(u string) {
-	if u = strings.TrimSpace(u); u != "" {
-		c.baseURL = strings.TrimRight(u, "/")
 	}
 }
 
@@ -49,11 +38,9 @@ type slackResponse struct {
 	OK    bool   `json:"ok"`
 	Error string `json:"error"`
 	// chat.postMessage / chat.update
-	TS      string `json:"ts"`
-	Channel string `json:"channel"`
+	TS string `json:"ts"`
 	// auth.test
 	UserID string `json:"user_id"`
-	Team   string `json:"team"`
 	// apps.connections.open
 	URL string `json:"url"`
 	// conversations.replies
@@ -75,7 +62,7 @@ type slackMessage struct {
 
 // AuthTest returns the bot's own user id, so the connector can strip the leading
 // mention from a message and ignore the bot's own posts.
-func (c *SlackClient) AuthTest(ctx context.Context) (userID string, err error) {
+func (c *SlackClient) AuthTest(ctx context.Context) (string, error) {
 	var out slackResponse
 	if err := c.call(ctx, c.token, "auth.test", map[string]any{}, &out); err != nil {
 		return "", err
@@ -118,16 +105,8 @@ func (c *SlackClient) Replies(ctx context.Context, channel, threadTS string) ([]
 
 // PostMessage posts text into a thread and returns the new message's ts (its
 // handle for later chat.update calls). threadTS is the parent message's ts.
-func (c *SlackClient) PostMessage(ctx context.Context, channel, threadTS, text string) (ts string, err error) {
-	body := map[string]any{"channel": channel, "text": text}
-	if threadTS != "" {
-		body["thread_ts"] = threadTS
-	}
-	var out slackResponse
-	if err := c.call(ctx, c.token, "chat.postMessage", body, &out); err != nil {
-		return "", err
-	}
-	return out.TS, nil
+func (c *SlackClient) PostMessage(ctx context.Context, channel, threadTS, text string) (string, error) {
+	return c.postMessage(ctx, map[string]any{"channel": channel, "thread_ts": threadTS, "text": text})
 }
 
 // UpdateMessage edits an existing message in place — used to keep a single
@@ -144,10 +123,10 @@ func (c *SlackClient) UpdateMessage(ctx context.Context, channel, ts, text strin
 // notification/accessibility fallback; blocks is the rich layout (e.g. an
 // approval prompt with buttons). Returns the new message's ts.
 func (c *SlackClient) PostBlockMessage(ctx context.Context, channel, threadTS, text string, blocks []map[string]any) (string, error) {
-	body := map[string]any{"channel": channel, "text": text, "blocks": blocks}
-	if threadTS != "" {
-		body["thread_ts"] = threadTS
-	}
+	return c.postMessage(ctx, map[string]any{"channel": channel, "thread_ts": threadTS, "text": text, "blocks": blocks})
+}
+
+func (c *SlackClient) postMessage(ctx context.Context, body map[string]any) (string, error) {
 	var out slackResponse
 	if err := c.call(ctx, c.token, "chat.postMessage", body, &out); err != nil {
 		return "", err

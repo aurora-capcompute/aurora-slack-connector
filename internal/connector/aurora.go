@@ -30,9 +30,6 @@ type AuroraClient struct {
 // NewAuroraClient returns a client for the aurora-dist base URL (e.g.
 // http://localhost:8080). timeout bounds each individual request.
 func NewAuroraClient(baseURL string, timeout time.Duration) *AuroraClient {
-	if timeout <= 0 {
-		timeout = 30 * time.Second
-	}
 	return &AuroraClient{
 		baseURL: strings.TrimRight(baseURL, "/"),
 		http:    &http.Client{Timeout: timeout},
@@ -80,7 +77,6 @@ type ProcessSnapshot struct {
 type SessionLog struct {
 	Session struct {
 		ID              string `json:"id"`
-		Name            string `json:"name"`
 		ActiveProcessID string `json:"active_process_id"`
 	} `json:"session"`
 	Processes []ProcessLog `json:"processes"`
@@ -196,24 +192,10 @@ func IsConflict(err error) bool {
 }
 
 // CreateSession creates a session (one per Slack thread) and returns its id.
-// name is an optional human handle; tags are opaque key/values stored on the
-// session.
+// name is its unique handle, and tags are opaque key/values stored on it.
 func (c *AuroraClient) CreateSession(ctx context.Context, name string, tags map[string]string) (string, error) {
-	body := map[string]any{}
-	if name != "" {
-		body["name"] = name
-	}
-	if len(tags) > 0 {
-		body["tags"] = tags
-	}
-	var out SessionLog
-	if err := c.do(ctx, http.MethodPost, "/v1/sessions", body, &out); err != nil {
-		return "", err
-	}
-	if out.Session.ID == "" {
-		return "", fmt.Errorf("aurora: created session has no id")
-	}
-	return out.Session.ID, nil
+	out, err := call[SessionLog](ctx, c, http.MethodPost, "/v1/sessions", map[string]any{"name": name, "tags": tags})
+	return out.Session.ID, err
 }
 
 // SessionSummary is one entry of the session list (GET /v1/sessions).
@@ -222,81 +204,45 @@ type SessionSummary struct {
 	Name string `json:"name"`
 }
 
-// ListSessions returns every session summary the runtime holds.
-func (c *AuroraClient) ListSessions(ctx context.Context) ([]SessionSummary, error) {
-	var out []SessionSummary
-	err := c.do(ctx, http.MethodGet, "/v1/sessions", nil, &out)
-	return out, err
-}
-
-// FindSessionByName returns the id of the session with the given explicit name,
-// or "" if none — the durable lookup that lets a Slack thread reattach to its
-// aurora session after the connector restarts or retires the in-memory worker.
-func (c *AuroraClient) FindSessionByName(ctx context.Context, name string) (string, error) {
-	if name == "" {
-		return "", nil
+// EnsureSession returns the id of the session with the given name, creating it
+// if absent. Session names are unique, so a create that races (or a restart)
+// yields a conflict, and the existing session is then found by its name. This
+// is what makes "one Slack thread → one aurora session" hold across connector
+// restarts.
+func (c *AuroraClient) EnsureSession(ctx context.Context, name string, tags map[string]string) (string, error) {
+	id, err := c.CreateSession(ctx, name, tags)
+	if !IsConflict(err) {
+		return id, err
 	}
-	sessions, err := c.ListSessions(ctx)
-	if err != nil {
-		return "", err
+	sessions, findErr := call[[]SessionSummary](ctx, c, http.MethodGet, "/v1/sessions", nil)
+	if findErr != nil {
+		return "", fmt.Errorf("reattach session %q after conflict: %w", name, findErr)
 	}
 	for _, s := range sessions {
 		if s.Name == name {
 			return s.ID, nil
 		}
 	}
-	return "", nil
-}
-
-// EnsureSession returns the id of the session with the given name, creating it
-// if absent. Session names are unique per tenant, so a create that races (or a
-// restart) yields a conflict; we recover by looking the existing session up by
-// name. This is what makes "one Slack thread → one aurora session" hold across
-// connector restarts.
-func (c *AuroraClient) EnsureSession(ctx context.Context, name string, tags map[string]string) (string, error) {
-	id, err := c.CreateSession(ctx, name, tags)
-	if err == nil {
-		return id, nil
-	}
-	if !IsConflict(err) {
-		return "", err
-	}
-	existing, findErr := c.FindSessionByName(ctx, name)
-	if findErr != nil {
-		return "", fmt.Errorf("reattach session %q after conflict: %w", name, findErr)
-	}
-	if existing == "" {
-		return "", err
-	}
-	return existing, nil
+	return "", err
 }
 
 // CreateProcess starts a process on a session — the aurora spawn. input is the
 // user's message; manifest is the opaque grant set (LLM config, capabilities)
-// passed through verbatim. Aurora refuses a process without one.
+// passed through verbatim.
 func (c *AuroraClient) CreateProcess(ctx context.Context, sessionID, input string, manifest json.RawMessage) (ProcessSnapshot, error) {
-	body := map[string]any{"input": input}
-	if len(manifest) > 0 {
-		body["manifest"] = manifest
-	}
-	var out ProcessSnapshot
-	err := c.do(ctx, http.MethodPost, "/v1/sessions/"+sessionID+"/processes", body, &out)
-	return out, err
+	return call[ProcessSnapshot](ctx, c, http.MethodPost, "/v1/sessions/"+sessionID+"/processes",
+		map[string]any{"input": input, "manifest": manifest})
 }
 
 // GetProcess is the cheap status poll.
 func (c *AuroraClient) GetProcess(ctx context.Context, processID string) (ProcessSnapshot, error) {
-	var out ProcessSnapshot
-	err := c.do(ctx, http.MethodGet, "/v1/processes/"+processID, nil, &out)
-	return out, err
+	return call[ProcessSnapshot](ctx, c, http.MethodGet, "/v1/processes/"+processID, nil)
 }
 
 // GetSessionLog reads the whole session log — the only place the per-syscall
 // journal and the per-process tasks are exposed.
 func (c *AuroraClient) GetSessionLog(ctx context.Context, sessionID string) (SessionLog, error) {
-	var out SessionLog
-	err := c.do(ctx, http.MethodGet, "/v1/sessions/"+sessionID, nil, &out)
-	return out, err
+	return call[SessionLog](ctx, c, http.MethodGet, "/v1/sessions/"+sessionID, nil)
 }
 
 // ResolveTask settles a pending task — the human-in-the-loop decision. token is
@@ -305,24 +251,19 @@ func (c *AuroraClient) GetSessionLog(ctx context.Context, sessionID string) (Ses
 // on the resolution for the audit trail. On success the runtime resumes the
 // process that was parked on the task.
 func (c *AuroraClient) ResolveTask(ctx context.Context, taskID, token, decision, actor, reason string) (Task, error) {
-	body := map[string]any{
+	return call[Task](ctx, c, http.MethodPost, "/v1/tasks/"+taskID+"/resolve", map[string]any{
 		"resolution_token": token,
 		"resolution": map[string]any{
 			"decision": decision,
 			"actor":    actor,
 			"reason":   reason,
 		},
-	}
-	var out Task
-	err := c.do(ctx, http.MethodPost, "/v1/tasks/"+taskID+"/resolve", body, &out)
-	return out, err
+	})
 }
 
 // Retry resumes an interrupted process from where its journal stopped.
 func (c *AuroraClient) Retry(ctx context.Context, processID string) (ProcessSnapshot, error) {
-	var out ProcessSnapshot
-	err := c.do(ctx, http.MethodPost, "/v1/processes/"+processID+"/retry", map[string]any{"mode": "resume"}, &out)
-	return out, err
+	return call[ProcessSnapshot](ctx, c, http.MethodPost, "/v1/processes/"+processID+"/retry", map[string]any{"mode": "resume"})
 }
 
 // Healthz reports whether the aurora-dist instance answers its health check.
@@ -343,30 +284,33 @@ func (c *AuroraClient) Healthz(ctx context.Context) error {
 	return nil
 }
 
-func (c *AuroraClient) do(ctx context.Context, method, path string, body, out any) error {
+// call sends one request and decodes the response into a T. A failure status
+// comes back as an *apiError.
+func call[T any](ctx context.Context, c *AuroraClient, method, path string, body any) (T, error) {
+	var out T
 	var reader io.Reader
 	if body != nil {
 		raw, err := json.Marshal(body)
 		if err != nil {
-			return err
+			return out, err
 		}
 		reader = bytes.NewReader(raw)
 	}
 	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, reader)
 	if err != nil {
-		return err
+		return out, err
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return fmt.Errorf("aurora %s %s: %w", method, path, err)
+		return out, fmt.Errorf("aurora %s %s: %w", method, path, err)
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("aurora %s %s: read body: %w", method, path, err)
+		return out, fmt.Errorf("aurora %s %s: read body: %w", method, path, err)
 	}
 	if resp.StatusCode >= 300 {
 		ae := &apiError{Status: resp.StatusCode}
@@ -374,12 +318,10 @@ func (c *AuroraClient) do(ctx context.Context, method, path string, body, out an
 		if ae.Message == "" {
 			ae.Message = strings.TrimSpace(string(raw))
 		}
-		return ae
+		return out, ae
 	}
-	if out != nil && len(raw) > 0 {
-		if err := json.Unmarshal(raw, out); err != nil {
-			return fmt.Errorf("aurora %s %s: decode response: %w", method, path, err)
-		}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return out, fmt.Errorf("aurora %s %s: decode response: %w", method, path, err)
 	}
-	return nil
+	return out, nil
 }

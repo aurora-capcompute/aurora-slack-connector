@@ -35,8 +35,7 @@ func main() {
 	defer stop()
 
 	aurora := connector.NewAuroraClient(cfg.AuroraBaseURL, cfg.HTTPTimeout)
-	slack := connector.NewSlackClient(cfg.SlackBotToken, cfg.HTTPTimeout)
-	slack.SetAPIBaseURL(cfg.SlackAPIBaseURL)
+	slack := connector.NewSlackClient(cfg.SlackBotToken, cfg.SlackAPIBaseURL, cfg.HTTPTimeout)
 
 	// A reachable aurora at boot is not required (it may start after us), but a
 	// failing health check is worth surfacing.

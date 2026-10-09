@@ -1,6 +1,7 @@
 package connector
 
 import (
+	"cmp"
 	"encoding/json"
 	"fmt"
 	"net/url"
@@ -35,9 +36,9 @@ func syscallLabel(name string, args json.RawMessage) string {
 		}
 		return "🌐 " + strings.ToUpper(call.Method) + " to " + host
 	case "core.httpTemplate":
-		return "🔌 Calling " + orDefault(call.Operation, "a service")
+		return "🔌 Calling " + cmp.Or(call.Operation, "a service")
 	case "core.command":
-		return "🖥️ Running " + orDefault(call.Operation, "a command")
+		return "🖥️ Running " + cmp.Or(call.Operation, "a command")
 	case "core.scratch":
 		switch call.Operation {
 		case "store":
@@ -57,13 +58,6 @@ func syscallLabel(name string, args json.RawMessage) string {
 	default:
 		return "⚙️ " + name
 	}
-}
-
-func orDefault(value, fallback string) string {
-	if value == "" {
-		return fallback
-	}
-	return value
 }
 
 // step is one collapsed run of the timeline: a label and how many consecutive

@@ -204,8 +204,7 @@ func newTestConnector(t *testing.T, a *auroraStub, sl *slackStub) *Connector {
 		HTTPTimeout:    2 * time.Second,
 	}
 	aurora := NewAuroraClient(a.server.URL, cfg.HTTPTimeout)
-	slack := NewSlackClient("xoxb-test", cfg.HTTPTimeout)
-	slack.baseURL = sl.server.URL
+	slack := NewSlackClient("xoxb-test", sl.server.URL, cfg.HTTPTimeout)
 	return New(cfg, aurora, slack, discardLogger())
 }
 
@@ -345,8 +344,7 @@ func TestThreadInputCarriesTheMessagesSinceThePreviousMention(t *testing.T) {
 		{"bot_id":"B9","username":"alertbot","text":"CPU above 90%","ts":"300.000130"},
 		{"user":"U1","text":"<@UBOT> what changed?","ts":"300.000140"},
 		{"user":"U3","text":"a later message","ts":"300.000150"}]`
-	slack := NewSlackClient("xoxb-test", time.Second)
-	slack.baseURL = sl.server.URL
+	slack := NewSlackClient("xoxb-test", sl.server.URL, time.Second)
 	conn := New(Config{ChannelID: "C1", BotUserID: "UBOT"}, nil, slack, discardLogger())
 
 	input, err := conn.threadInput(context.Background(), &thread{threadTS: "300.000100"},

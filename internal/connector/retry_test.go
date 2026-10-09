@@ -81,8 +81,7 @@ func TestEndedProcessOffersRetry(t *testing.T) {
 				ProcessTimeout: 5 * time.Second,
 				HTTPTimeout:    2 * time.Second,
 			}
-			slack := NewSlackClient("xoxb-test", cfg.HTTPTimeout)
-			slack.baseURL = sl.server.URL
+			slack := NewSlackClient("xoxb-test", sl.server.URL, cfg.HTTPTimeout)
 			conn := New(cfg, NewAuroraClient(a.server.URL, cfg.HTTPTimeout), slack, discardLogger())
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()

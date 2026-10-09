@@ -190,8 +190,7 @@ func TestApprovalEndToEnd(t *testing.T) {
 		HTTPTimeout:    2 * time.Second,
 	}
 	aurora := NewAuroraClient(a.server.URL, cfg.HTTPTimeout)
-	slack := NewSlackClient("xoxb-test", cfg.HTTPTimeout)
-	slack.baseURL = sl.server.URL
+	slack := NewSlackClient("xoxb-test", sl.server.URL, cfg.HTTPTimeout)
 	conn := New(cfg, aurora, slack, discardLogger())
 
 	ctx, cancel := context.WithCancel(context.Background())

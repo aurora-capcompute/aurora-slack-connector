@@ -1,6 +1,7 @@
 package connector
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -28,8 +29,8 @@ const (
 // Socket Mode connection, maps each thread to an aurora session, and runs each
 // mention of the bot as a process (an "aurora spawn") in that session —
 // serialized per thread so the session's single-active-process rule holds and
-// history is shared across mentions. While a process runs it polls aurora and narrates the syscalls back
-// into the thread.
+// history is shared across mentions. While a process runs it polls aurora and
+// narrates the syscalls back into the thread.
 type Connector struct {
 	cfg       Config
 	aurora    *AuroraClient
@@ -68,17 +69,13 @@ type work struct {
 
 // New builds a Connector from config and its two clients.
 func New(cfg Config, aurora *AuroraClient, slack *SlackClient, logger *slog.Logger) *Connector {
-	if logger == nil {
-		logger = slog.Default()
-	}
 	return &Connector{
 		cfg:       cfg,
 		aurora:    aurora,
 		slack:     slack,
 		botUserID: cfg.BotUserID,
 		logger:    logger,
-		// Background until Start installs the cancellable context, so an event
-		// that somehow arrives before Start never dereferences a nil context.
+		// Start installs the cancellable context.
 		ctx:     context.Background(),
 		threads: make(map[string]*thread),
 		seen:    newSeenSet(seenCapacity),
@@ -128,22 +125,10 @@ type slackEvent struct {
 // mention's input carries them (see threadInput).
 func (c *Connector) dispatchEvent(env slackEnvelope) {
 	ev := env.Event
-	if ev.Type != "app_mention" {
-		return
-	}
-	// A duty bot owns exactly one channel.
-	if ev.Channel != c.cfg.ChannelID {
-		return
-	}
-	// Ignore edits and every other message subtype; ignore anything posted by a
-	// bot (including ourselves) to avoid loops.
-	if ev.Subtype != "" || ev.BotID != "" {
-		return
-	}
-	if c.botUserID != "" && ev.User == c.botUserID {
-		return
-	}
-	if ev.User == "" {
+	// A duty bot owns exactly one channel. Edits, every other message subtype
+	// and anything a bot posted (ourselves included) are ignored, to avoid loops.
+	if ev.Type != "app_mention" || ev.Channel != c.cfg.ChannelID ||
+		ev.Subtype != "" || ev.BotID != "" || ev.User == "" || ev.User == c.botUserID {
 		return
 	}
 	// Dedup: Slack delivers an envelope again until it is acknowledged, and the
@@ -225,7 +210,7 @@ func (c *Connector) runThread(t *thread) {
 	for {
 		select {
 		case w := <-t.inbox:
-			resetTimer(idle, idleTimeout)
+			idle.Reset(idleTimeout)
 			if w.retryID != "" {
 				c.handleRetry(c.ctx, t, w.retryID)
 			} else {
@@ -237,7 +222,7 @@ func (c *Connector) runThread(t *thread) {
 			c.mu.Lock()
 			if len(t.inbox) > 0 {
 				c.mu.Unlock()
-				resetTimer(idle, idleTimeout)
+				idle.Reset(idleTimeout)
 				continue
 			}
 			delete(c.threads, t.threadTS)
@@ -524,11 +509,7 @@ func (c *Connector) postOutcome(ctx context.Context, t *thread, snap ProcessSnap
 // postWithRetry posts text about a process that ended without an answer, with
 // a Retry button that resumes the process.
 func (c *Connector) postWithRetry(ctx context.Context, t *thread, snap ProcessSnapshot, text string) {
-	value, err := json.Marshal(buttonValue{Process: snap.ID, Session: t.sessionID, Thread: t.threadTS})
-	if err != nil {
-		c.logger.Warn("encode retry button", "process", snap.ID, "error", err)
-		return
-	}
+	value, _ := json.Marshal(buttonValue{Process: snap.ID, Session: t.sessionID, Thread: t.threadTS})
 	blocks := []map[string]any{
 		{"type": "section", "text": map[string]any{"type": "mrkdwn", "text": text}},
 		{"type": "actions", "block_id": "duty_retry", "elements": []map[string]any{
@@ -606,22 +587,6 @@ func statusHeader(status string, awaitingApproval bool) string {
 	}
 }
 
-func resetTimer(t *time.Timer, d time.Duration) {
-	if !t.Stop() {
-		select {
-		case <-t.C:
-		default:
-		}
-	}
-	t.Reset(d)
-}
-
-// collapseSpaces flattens every run of whitespace (including newlines) to a
-// single space — for single-line renderings like error details.
-func collapseSpaces(s string) string {
-	return strings.Join(strings.Fields(s), " ")
-}
-
 // normalizeInput collapses horizontal whitespace within each line but keeps the
 // line breaks, then trims — so multi-line input reaches aurora intact.
 func normalizeInput(s string) string {
@@ -632,21 +597,18 @@ func normalizeInput(s string) string {
 	return strings.TrimSpace(strings.Join(lines, "\n"))
 }
 
-// truncate bounds a string to max runes (not bytes, so it never splits a
+// truncate bounds a string to limit runes (not bytes, so it never splits a
 // multi-byte rune), appending an ellipsis when it cuts.
-func truncate(s string, max int) string {
+func truncate(s string, limit int) string {
 	r := []rune(s)
-	if len(r) <= max {
+	if len(r) <= limit {
 		return s
 	}
-	return string(r[:max]) + "…"
+	return string(r[:limit]) + "…"
 }
 
-// oneLine flattens and bounds an error/detail string for a chat line.
+// oneLine flattens every run of whitespace to one space and bounds the result,
+// for an error or detail on a chat line.
 func oneLine(s string) string {
-	s = truncate(collapseSpaces(s), 500)
-	if s == "" {
-		return "(no detail)"
-	}
-	return s
+	return cmp.Or(truncate(strings.Join(strings.Fields(s), " "), 500), "(no detail)")
 }
