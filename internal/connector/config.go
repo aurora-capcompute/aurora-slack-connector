@@ -20,9 +20,10 @@ type Config struct {
 	// SlackBotToken (xoxb-...) authorizes Web API calls: posting and updating
 	// messages, and auth.test at startup.
 	SlackBotToken string
-	// SlackSigningSecret verifies that inbound Events API requests really came
-	// from Slack (HMAC over the raw body and timestamp).
-	SlackSigningSecret string
+	// SlackAppToken (xapp-..., with connections:write) opens the Socket Mode
+	// connection that delivers events and button clicks. The connector makes
+	// only outbound connections, so it needs no public URL.
+	SlackAppToken string
 	// ChannelID is the single channel this connector serves. Events from any
 	// other channel are ignored — a duty bot owns exactly one room.
 	ChannelID string
@@ -46,17 +47,6 @@ type Config struct {
 	// spawn) this connector starts. Passed through verbatim.
 	Manifest json.RawMessage
 
-	// --- HTTP server ---
-
-	// Addr is the listen address for the Slack events receiver (e.g. :3000).
-	Addr string
-	// EventsPath is the path Slack posts events to (default /slack/events).
-	EventsPath string
-	// InteractionsPath is the path Slack posts interactive actions to — the
-	// Approve/Deny button clicks (default /slack/interactions). Must differ from
-	// EventsPath.
-	InteractionsPath string
-
 	// --- Polling ---
 
 	// PollInterval is how often a running process is polled for progress.
@@ -70,37 +60,22 @@ type Config struct {
 }
 
 // LoadConfig reads configuration from the environment. Required: SLACK_BOT_TOKEN,
-// SLACK_SIGNING_SECRET, SLACK_CHANNEL_ID, and a manifest (AURORA_MANIFEST inline
-// JSON or AURORA_MANIFEST_FILE path).
+// SLACK_APP_TOKEN, SLACK_CHANNEL_ID, and a manifest (AURORA_MANIFEST inline JSON
+// or AURORA_MANIFEST_FILE path).
 func LoadConfig() (Config, error) {
 	cfg := Config{
-		SlackBotToken:      strings.TrimSpace(os.Getenv("SLACK_BOT_TOKEN")),
-		SlackSigningSecret: strings.TrimSpace(os.Getenv("SLACK_SIGNING_SECRET")),
-		ChannelID:          strings.TrimSpace(os.Getenv("SLACK_CHANNEL_ID")),
-		TriggerKeyword:     strings.TrimSpace(os.Getenv("SLACK_TRIGGER_KEYWORD")),
-		BotUserID:          strings.TrimSpace(os.Getenv("SLACK_BOT_USER_ID")),
-		SlackAPIBaseURL:    strings.TrimSpace(os.Getenv("SLACK_API_BASE_URL")),
-		AuroraBaseURL:      strings.TrimSpace(os.Getenv("AURORA_BASE_URL")),
-		Addr:               strings.TrimSpace(os.Getenv("ADDR")),
-		EventsPath:         strings.TrimSpace(os.Getenv("EVENTS_PATH")),
-		InteractionsPath:   strings.TrimSpace(os.Getenv("INTERACTIONS_PATH")),
+		SlackBotToken:   strings.TrimSpace(os.Getenv("SLACK_BOT_TOKEN")),
+		SlackAppToken:   strings.TrimSpace(os.Getenv("SLACK_APP_TOKEN")),
+		ChannelID:       strings.TrimSpace(os.Getenv("SLACK_CHANNEL_ID")),
+		TriggerKeyword:  strings.TrimSpace(os.Getenv("SLACK_TRIGGER_KEYWORD")),
+		BotUserID:       strings.TrimSpace(os.Getenv("SLACK_BOT_USER_ID")),
+		SlackAPIBaseURL: strings.TrimSpace(os.Getenv("SLACK_API_BASE_URL")),
+		AuroraBaseURL:   strings.TrimSpace(os.Getenv("AURORA_BASE_URL")),
 	}
 
 	if cfg.AuroraBaseURL == "" {
 		cfg.AuroraBaseURL = "http://localhost:8080"
 	}
-	if cfg.Addr == "" {
-		cfg.Addr = ":3000"
-	}
-	if cfg.EventsPath == "" {
-		cfg.EventsPath = "/slack/events"
-	}
-	if cfg.InteractionsPath == "" {
-		cfg.InteractionsPath = "/slack/interactions"
-	}
-	// A leading slash is required by the HTTP mux pattern; tolerate it missing.
-	cfg.EventsPath = ensureLeadingSlash(cfg.EventsPath)
-	cfg.InteractionsPath = ensureLeadingSlash(cfg.InteractionsPath)
 	if cfg.TriggerKeyword == "" {
 		cfg.TriggerKeyword = "@duty"
 	}
@@ -156,13 +131,6 @@ func loadManifest() (json.RawMessage, error) {
 	return compact, nil
 }
 
-func ensureLeadingSlash(p string) string {
-	if p == "" || strings.HasPrefix(p, "/") {
-		return p
-	}
-	return "/" + p
-}
-
 func durationEnv(key string, def time.Duration) (time.Duration, error) {
 	v := strings.TrimSpace(os.Getenv(key))
 	if v == "" {
@@ -184,14 +152,12 @@ func (c Config) Validate() error {
 	switch {
 	case c.SlackBotToken == "":
 		return fmt.Errorf("SLACK_BOT_TOKEN is required")
-	case c.SlackSigningSecret == "":
-		return fmt.Errorf("SLACK_SIGNING_SECRET is required")
+	case c.SlackAppToken == "":
+		return fmt.Errorf("SLACK_APP_TOKEN is required")
 	case c.ChannelID == "":
 		return fmt.Errorf("SLACK_CHANNEL_ID is required")
 	case len(c.Manifest) == 0:
 		return fmt.Errorf("a manifest is required (set AURORA_MANIFEST or AURORA_MANIFEST_FILE)")
-	case c.InteractionsPath != "" && c.InteractionsPath == c.EventsPath:
-		return fmt.Errorf("EVENTS_PATH and INTERACTIONS_PATH must differ")
 	case c.PollInterval <= 0:
 		return fmt.Errorf("POLL_INTERVAL must be positive")
 	case c.ProcessTimeout <= 0:

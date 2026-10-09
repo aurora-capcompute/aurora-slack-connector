@@ -1,6 +1,6 @@
 # aurora-slack-connector
 
-An HTTP server that turns one Slack channel into a duty bot backed by an
+A service that turns one Slack channel into a duty bot backed by an
 [aurora-dist](https://github.com/aurora-capcompute/aurora-dist) server. Mention
 the bot, and it opens an Aurora session for the thread, runs your message as a
 process, and reports each syscall in the thread while it works. Later messages
@@ -10,15 +10,16 @@ The bot gathers information to help a human handle an incident. When it needs a
 sensitive action, it asks first: a human approves or denies in the thread.
 
 ```
-Slack events  ──▶ ┌────────────────────────┐ ── /v1 ──▶ aurora-dist
-Slack actions ──▶ │ aurora-slack-connector │ ◀── poll: journal, tasks
-     ▲            └────────────────────────┘
-     └── chat.postMessage, update, Approve/Deny buttons (in the thread)
+Slack ── events, clicks (Socket Mode) ──▶ ┌────────────────────────┐ ── /v1 ──▶ aurora-dist
+  ▲                                       │ aurora-slack-connector │ ◀── poll: journal, tasks
+  └───── chat.postMessage, chat.update ── └────────────────────────┘
 ```
 
 The connector is a client of aurora-dist's `/v1` API. It does not embed the
-runtime, and it uses only the Go standard library. The agent, its capabilities
-and its secrets live in Aurora and in the manifest you give it.
+runtime. Slack reaches it over Socket Mode: the connector opens a WebSocket to
+Slack, so it needs no public URL and listens on no port. Its one dependency is
+the WebSocket client. The agent, its capabilities and its secrets live in Aurora
+and in the manifest you give it.
 
 ## How Slack maps onto Aurora
 
@@ -30,8 +31,8 @@ and its secrets live in Aurora and in the manifest you give it.
 | "what is it doing?" | the process's journal. Each syscall becomes a status line. |
 | an approval prompt | a pending task, resolved with `POST /v1/tasks/{id}/resolve` |
 
-- **Shared history.** Aurora gives each new process its session's history and
-  adds each finished process's input and answer to it. So message *n* sees
+- **Shared history.** Aurora gives each new process its session's history: the
+  input and answer of each completed process before it. So message *n* sees
   messages *1 … n-1*, unless the manifest sets `"history": false`. The connector
   finds a thread's session by name, also after a restart.
 - **One process per thread at a time.** A session runs one process at a time,
@@ -56,9 +57,8 @@ A grant with `require_approval: true` makes Aurora park the process on a task
    (its arguments, or a command's resolved command line), shows when the
    request expires, and has **Approve** / **Deny** buttons. The status line
    shows `⏸️ waiting for your approval`, and the process timeout waits.
-2. On a click, verifies the Slack signature, reads the task again from the
-   session (its state and `resolution_token`), and resolves it with the
-   decision. The clicking user is the `actor` in the audit trail.
+2. On a click, reads the task again from the session (its state and
+   `resolution_token`), and resolves it with the decision. The clicking user is the `actor` in the audit trail.
 3. Rewrites the prompt to `✅ Approved by @user` or `🚫 Denied by @user` and
    removes the buttons. Aurora resumes the process.
 
@@ -69,21 +69,18 @@ raise a prompt: the runtime fires them. Any channel member can approve or deny.
 
 ## Slack app setup
 
-1. **Bot token scopes:** `app_mentions:read`, `channels:history` (or
+1. **Socket Mode:** turn it on. Create an app-level token with the
+   `connections:write` scope, and copy it (`xapp-…`).
+2. **Bot token scopes:** `app_mentions:read`, `channels:history` (or
    `groups:history` for a private channel), `chat:write`. Install the app and
    copy the bot token (`xoxb-…`).
-2. **Event Subscriptions:** set the Request URL to
-   `https://<host>/slack/events`, and subscribe to `app_mention` and
-   `message.channels` (or `message.groups`). The connector answers Slack's
-   verification request.
-3. **Interactivity:** set the Request URL to `https://<host>/slack/interactions`.
-   This delivers the button clicks.
-4. **Signing secret:** copy it from *Basic Information*. The connector verifies
-   every request with it.
+3. **Event Subscriptions:** turn them on, and subscribe to `app_mention` and
+   `message.channels` (or `message.groups`). Socket Mode needs no Request URL.
+4. **Interactivity:** turn it on. This delivers the button clicks. Socket Mode
+   needs no Request URL.
 5. Invite the bot to its one channel and note the channel id (`C…`).
 
-Slack must reach the connector at a public HTTPS URL (an ingress, or a tunnel in
-development).
+The connector makes only outbound connections: to Slack and to aurora-dist.
 
 ## Configuration
 
@@ -93,16 +90,13 @@ Slack credentials. The LLM endpoint, keys and grants are in the manifest.
 | Variable | Required | Default | Meaning |
 | --- | --- | --- | --- |
 | `SLACK_BOT_TOKEN` | yes | | Bot token (`xoxb-…`) |
-| `SLACK_SIGNING_SECRET` | yes | | Verifies requests from Slack |
+| `SLACK_APP_TOKEN` | yes | | App-level token (`xapp-…`, `connections:write`) for Socket Mode |
 | `SLACK_CHANNEL_ID` | yes | | The one channel to serve |
 | `AURORA_MANIFEST` or `AURORA_MANIFEST_FILE` | yes | | The manifest for every process (JSON, or a path) |
 | `AURORA_BASE_URL` | | `http://localhost:8080` | The aurora-dist address. A host name other than `localhost` or an IP address must be in aurora-dist's `trusted_hosts`. |
 | `SLACK_TRIGGER_KEYWORD` | | `@duty` | A keyword that starts a thread. A mention of the bot always works. |
 | `SLACK_BOT_USER_ID` | | from `auth.test` | The bot's user id |
 | `SLACK_API_BASE_URL` | | `https://slack.com/api` | For a gateway or for tests |
-| `ADDR` | | `:3000` | Listen address |
-| `EVENTS_PATH` | | `/slack/events` | Events path |
-| `INTERACTIONS_PATH` | | `/slack/interactions` | Button-click path (must differ from `EVENTS_PATH`) |
 | `POLL_INTERVAL` | | `2s` | How often a running process is polled |
 | `PROCESS_TIMEOUT` | | `15m` | How long to follow one process |
 | `HTTP_TIMEOUT` | | `30s` | Timeout of one request to Aurora or Slack |
@@ -121,7 +115,7 @@ so a gated call needs a human. Read-only lookups can stay ungated.
 
 ```sh
 export SLACK_BOT_TOKEN=xoxb-...
-export SLACK_SIGNING_SECRET=...
+export SLACK_APP_TOKEN=xapp-...
 export SLACK_CHANNEL_ID=C0123456789
 export AURORA_MANIFEST_FILE=./duty-manifest.json
 go run ./cmd/aurora-slack-connector
@@ -138,15 +132,16 @@ go vet ./...
 go test -race ./...
 ```
 
-The tests stub aurora-dist and the Slack API with `httptest` servers. They
-cover session creation, process start, journal polling, progress updates,
-duplicate deliveries, signature checks, thread-to-session reattachment, and the
-full approval flow.
+The tests stub aurora-dist, the Slack API and the Socket Mode connection with
+`httptest` servers. They cover session creation, process start, journal
+polling, progress updates, duplicate deliveries, envelope acknowledgement and
+reconnection, thread-to-session reattachment, and the full approval flow.
 
 ## Limits
 
 - One channel per connector.
-- Events API only, so the connector needs a public URL.
+- Run one connector per app. Slack spreads the events over all open Socket
+  Mode connections of the app.
 - Approvals are approve or deny. Other resolutions (such as `completed` with
   data) have no button.
 - The dedup set and the worker registry are in memory. The session name and

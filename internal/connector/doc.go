@@ -2,7 +2,8 @@
 // turning it into an on-call duty bot.
 //
 // It is a pure client of aurora-dist's HTTP API — it embeds none of the
-// runtime and has no dependency beyond the Go standard library. The shape of
+// runtime. Slack reaches it over Socket Mode, an outbound WebSocket, so it
+// needs no public URL. Its one dependency is the WebSocket client. The shape of
 // the integration:
 //
 //   - Each Slack thread is one aurora session (named "slack:<thread_ts>"), so a
@@ -14,7 +15,7 @@
 //   - While a process runs, the connector polls aurora and keeps a status
 //     message current with the syscall timeline, then posts the answer.
 //   - When a process parks on a pending approval task, the connector posts
-//     Approve/Deny buttons; a click is verified, resolved through
+//     Approve/Deny buttons; a click is resolved through
 //     POST /v1/tasks/{id}/resolve, and the parked process resumes.
 //   - When a process is interrupted (past the server's time limit, or cut off
 //     by a restart), the connector says so and posts a Retry button; a click
@@ -26,12 +27,13 @@
 //
 // File layout:
 //
-//   - connector.go — the Connector type, lifecycle, HTTP mux, event ingestion
-//     and routing, the per-thread worker, and process polling.
-//   - approvals.go — the interactions endpoint, the approval prompt and its
-//     resolution, and the Retry button.
+//   - connector.go — the Connector type, lifecycle, event routing, the
+//     per-thread worker, and process polling.
+//   - socket.go    — the Socket Mode connection: receive, acknowledge, route.
+//   - approvals.go — the approval prompt and its resolution, and the Retry
+//     button.
 //   - aurora.go    — the aurora-dist HTTP client (sessions, processes, tasks).
-//   - slack.go     — the Slack Web API client and request-signature verifier.
+//   - slack.go     — the Slack Web API client.
 //   - progress.go  — rendering the syscall journal as a human status timeline.
 //   - config.go    — environment configuration.
 //   - seen.go      — bounded event de-duplication.

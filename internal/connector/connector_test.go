@@ -186,16 +186,13 @@ func (s *slackStub) close() { s.server.Close() }
 func newTestConnector(t *testing.T, a *auroraStub, sl *slackStub) *Connector {
 	t.Helper()
 	cfg := Config{
-		SlackSigningSecret: "secret",
-		ChannelID:          "C1",
-		TriggerKeyword:     "@duty",
-		EventsPath:         "/slack/events",
-		InteractionsPath:   "/slack/interactions",
-		AuroraBaseURL:      a.server.URL,
-		Manifest:           json.RawMessage(`{"version":4}`),
-		PollInterval:       5 * time.Millisecond,
-		ProcessTimeout:     5 * time.Second,
-		HTTPTimeout:        2 * time.Second,
+		ChannelID:      "C1",
+		TriggerKeyword: "@duty",
+		AuroraBaseURL:  a.server.URL,
+		Manifest:       json.RawMessage(`{"version":4}`),
+		PollInterval:   5 * time.Millisecond,
+		ProcessTimeout: 5 * time.Second,
+		HTTPTimeout:    2 * time.Second,
 	}
 	aurora := NewAuroraClient(a.server.URL, cfg.HTTPTimeout)
 	slack := NewSlackClient("xoxb-test", cfg.HTTPTimeout)
@@ -221,8 +218,7 @@ func waitForPost(t *testing.T, ch chan string, substr string, timeout time.Durat
 
 func mentionEvent(user, text, ts, threadTS string) slackEnvelope {
 	return slackEnvelope{
-		Type:    "event_callback",
-		EventID: "Ev" + ts,
+		Type: "event_callback",
 		Event: slackEvent{
 			Type: "app_mention", User: user, Text: text, TS: ts, ThreadTS: threadTS, Channel: "C1",
 		},
@@ -377,45 +373,6 @@ func TestConnectorDedupSameMessage(t *testing.T) {
 	defer a.mu.Unlock()
 	if a.processCreates != 1 {
 		t.Fatalf("dedup failed: %d processes created", a.processCreates)
-	}
-}
-
-func TestHandleEventsURLVerification(t *testing.T) {
-	a := newAuroraStub()
-	defer a.close()
-	sl := newSlackStub()
-	defer sl.close()
-	conn := newTestConnector(t, a, sl)
-	conn.ctx = context.Background()
-
-	body := `{"type":"url_verification","challenge":"abc123"}`
-	req := httptest.NewRequest(http.MethodPost, "/slack/events", strings.NewReader(body))
-	for k, v := range signSlack("secret", body, time.Now()) {
-		req.Header[k] = v
-	}
-	rec := httptest.NewRecorder()
-	conn.Handler().ServeHTTP(rec, req)
-	if rec.Code != 200 || rec.Body.String() != "abc123" {
-		t.Fatalf("challenge handshake: code=%d body=%q", rec.Code, rec.Body.String())
-	}
-}
-
-func TestHandleEventsRejectsBadSignature(t *testing.T) {
-	a := newAuroraStub()
-	defer a.close()
-	sl := newSlackStub()
-	defer sl.close()
-	conn := newTestConnector(t, a, sl)
-	conn.ctx = context.Background()
-
-	body := `{"type":"url_verification","challenge":"abc"}`
-	req := httptest.NewRequest(http.MethodPost, "/slack/events", strings.NewReader(body))
-	req.Header.Set("X-Slack-Request-Timestamp", fmt.Sprintf("%d", time.Now().Unix()))
-	req.Header.Set("X-Slack-Signature", "v0=deadbeef")
-	rec := httptest.NewRecorder()
-	conn.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("bad signature accepted: code=%d", rec.Code)
 	}
 }
 

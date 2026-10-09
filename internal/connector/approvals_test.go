@@ -6,7 +6,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -181,16 +180,13 @@ func TestApprovalEndToEnd(t *testing.T) {
 	defer sl.close()
 
 	cfg := Config{
-		SlackSigningSecret: "secret",
-		ChannelID:          "C1",
-		TriggerKeyword:     "@duty",
-		EventsPath:         "/slack/events",
-		InteractionsPath:   "/slack/interactions",
-		AuroraBaseURL:      a.server.URL,
-		Manifest:           json.RawMessage(`{"version":4}`),
-		PollInterval:       5 * time.Millisecond,
-		ProcessTimeout:     5 * time.Second,
-		HTTPTimeout:        2 * time.Second,
+		ChannelID:      "C1",
+		TriggerKeyword: "@duty",
+		AuroraBaseURL:  a.server.URL,
+		Manifest:       json.RawMessage(`{"version":4}`),
+		PollInterval:   5 * time.Millisecond,
+		ProcessTimeout: 5 * time.Second,
+		HTTPTimeout:    2 * time.Second,
 	}
 	aurora := NewAuroraClient(a.server.URL, cfg.HTTPTimeout)
 	slack := NewSlackClient("xoxb-test", cfg.HTTPTimeout)
@@ -219,7 +215,7 @@ func TestApprovalEndToEnd(t *testing.T) {
 		}
 	}
 
-	// Simulate the user clicking Approve: a signed interaction request.
+	// Simulate the user clicking Approve: an interactive envelope from Slack.
 	val, _ := json.Marshal(buttonValue{Task: "task_1", Session: "ses_1"})
 	payload := map[string]any{
 		"type":    "block_actions",
@@ -229,16 +225,7 @@ func TestApprovalEndToEnd(t *testing.T) {
 		"actions": []any{map[string]any{"action_id": actionApprove, "value": string(val)}},
 	}
 	pj, _ := json.Marshal(payload)
-	form := url.Values{"payload": {string(pj)}}.Encode()
-	req := httptest.NewRequest(http.MethodPost, "/slack/interactions", strings.NewReader(form))
-	for k, v := range signSlack("secret", form, time.Now()) {
-		req.Header[k] = v
-	}
-	rec := httptest.NewRecorder()
-	conn.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("interaction status = %d", rec.Code)
-	}
+	conn.route(socketMessage{Type: "interactive", EnvelopeID: "env1", Payload: pj})
 
 	// The task is resolved (approved).
 	select {
@@ -284,24 +271,5 @@ func TestApprovalEndToEnd(t *testing.T) {
 	}
 	if !sawApprovedUpdate {
 		t.Error("approval prompt was not rewritten to an Approved outcome")
-	}
-}
-
-func TestInteractionsRejectsBadSignature(t *testing.T) {
-	a := newAuroraStub()
-	defer a.close()
-	sl := newSlackStub()
-	defer sl.close()
-	conn := newTestConnector(t, a, sl)
-	conn.ctx = context.Background()
-
-	form := url.Values{"payload": {`{"type":"block_actions"}`}}.Encode()
-	req := httptest.NewRequest(http.MethodPost, "/slack/interactions", strings.NewReader(form))
-	req.Header.Set("X-Slack-Request-Timestamp", "1")
-	req.Header.Set("X-Slack-Signature", "v0=bad")
-	rec := httptest.NewRecorder()
-	conn.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("bad interaction signature accepted: %d", rec.Code)
 	}
 }

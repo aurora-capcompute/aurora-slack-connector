@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -70,15 +69,12 @@ func TestInterruptedProcessOffersRetry(t *testing.T) {
 	defer sl.close()
 
 	cfg := Config{
-		SlackSigningSecret: "secret",
-		ChannelID:          "C1",
-		TriggerKeyword:     "@duty",
-		EventsPath:         "/slack/events",
-		InteractionsPath:   "/slack/interactions",
-		Manifest:           json.RawMessage(`{"version":4}`),
-		PollInterval:       5 * time.Millisecond,
-		ProcessTimeout:     5 * time.Second,
-		HTTPTimeout:        2 * time.Second,
+		ChannelID:      "C1",
+		TriggerKeyword: "@duty",
+		Manifest:       json.RawMessage(`{"version":4}`),
+		PollInterval:   5 * time.Millisecond,
+		ProcessTimeout: 5 * time.Second,
+		HTTPTimeout:    2 * time.Second,
 	}
 	slack := NewSlackClient("xoxb-test", cfg.HTTPTimeout)
 	slack.baseURL = sl.server.URL
@@ -110,16 +106,7 @@ func TestInterruptedProcessOffersRetry(t *testing.T) {
 		"message": map[string]any{"ts": noticeTS},
 		"actions": []any{map[string]any{"action_id": actionRetry, "value": string(value)}},
 	})
-	form := url.Values{"payload": {string(payload)}}.Encode()
-	req := httptest.NewRequest(http.MethodPost, "/slack/interactions", strings.NewReader(form))
-	for k, v := range signSlack("secret", form, time.Now()) {
-		req.Header[k] = v
-	}
-	rec := httptest.NewRecorder()
-	conn.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("interaction status = %d", rec.Code)
-	}
+	conn.route(socketMessage{Type: "interactive", EnvelopeID: "env1", Payload: payload})
 
 	select {
 	case <-a.retryCh:

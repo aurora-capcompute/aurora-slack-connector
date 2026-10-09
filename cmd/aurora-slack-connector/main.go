@@ -1,6 +1,6 @@
-// Command aurora-slack-connector is a small HTTP server that bridges one Slack
-// channel to a local aurora-dist instance, turning it into an on-call "duty
-// bot": mention it (or use the configured trigger) in the channel and it opens
+// Command aurora-slack-connector bridges one Slack channel to a local
+// aurora-dist instance over Slack's Socket Mode, turning it into an on-call
+// "duty bot": mention it (or use the configured trigger) in the channel and it opens
 // an aurora session for the thread, runs your message as a process, and narrates
 // the syscalls back into the thread while it works. Follow-up messages in the
 // thread run as further processes in the same session, so the investigation
@@ -13,9 +13,7 @@ package main
 
 import (
 	"context"
-	"errors"
 	"log/slog"
-	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -53,24 +51,7 @@ func main() {
 	conn := connector.New(cfg, aurora, slack, logger)
 	conn.Start(ctx)
 
-	srv := &http.Server{
-		Addr:              cfg.Addr,
-		Handler:           conn.Handler(),
-		ReadHeaderTimeout: 10 * time.Second,
-	}
-
-	go func() {
-		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(shutdownCtx)
-	}()
-
-	logger.Info("aurora-slack-connector listening",
-		"addr", cfg.Addr, "events_path", cfg.EventsPath, "channel", cfg.ChannelID, "aurora", cfg.AuroraBaseURL)
-	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		logger.Error("http server", "error", err)
-		os.Exit(1)
-	}
+	logger.Info("aurora-slack-connector running", "channel", cfg.ChannelID, "aurora", cfg.AuroraBaseURL)
+	conn.RunSocket(ctx)
 	logger.Info("shut down cleanly")
 }

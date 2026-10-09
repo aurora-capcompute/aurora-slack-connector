@@ -3,21 +3,18 @@ package connector
 import (
 	"bytes"
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 )
 
 // SlackClient calls the Slack Web API: auth.test to learn the bot's identity at
-// startup, and chat.postMessage / chat.update to speak in a thread. Just enough
-// of the API for a single-channel duty bot, over the standard library — no SDK.
+// startup, chat.postMessage / chat.update to speak in a thread, and
+// apps.connections.open to start a Socket Mode connection. Just enough of the
+// API for a single-channel duty bot, over the standard library — no SDK.
 type SlackClient struct {
 	token   string
 	baseURL string // https://slack.com/api, overridable in tests
@@ -55,16 +52,29 @@ type slackResponse struct {
 	// auth.test
 	UserID string `json:"user_id"`
 	Team   string `json:"team"`
+	// apps.connections.open
+	URL string `json:"url"`
 }
 
 // AuthTest returns the bot's own user id, so the connector can strip the leading
 // mention from a message and ignore the bot's own posts.
 func (c *SlackClient) AuthTest(ctx context.Context) (userID string, err error) {
 	var out slackResponse
-	if err := c.call(ctx, "auth.test", map[string]any{}, &out); err != nil {
+	if err := c.call(ctx, c.token, "auth.test", map[string]any{}, &out); err != nil {
 		return "", err
 	}
 	return out.UserID, nil
+}
+
+// OpenConnection asks Slack for a Socket Mode WebSocket URL. It authenticates
+// with the app-level token (xapp-...), not the bot token. Each URL serves one
+// connection.
+func (c *SlackClient) OpenConnection(ctx context.Context, appToken string) (string, error) {
+	var out slackResponse
+	if err := c.call(ctx, appToken, "apps.connections.open", map[string]any{}, &out); err != nil {
+		return "", err
+	}
+	return out.URL, nil
 }
 
 // PostMessage posts text into a thread and returns the new message's ts (its
@@ -75,7 +85,7 @@ func (c *SlackClient) PostMessage(ctx context.Context, channel, threadTS, text s
 		body["thread_ts"] = threadTS
 	}
 	var out slackResponse
-	if err := c.call(ctx, "chat.postMessage", body, &out); err != nil {
+	if err := c.call(ctx, c.token, "chat.postMessage", body, &out); err != nil {
 		return "", err
 	}
 	return out.TS, nil
@@ -88,7 +98,7 @@ func (c *SlackClient) PostMessage(ctx context.Context, channel, threadTS, text s
 func (c *SlackClient) UpdateMessage(ctx context.Context, channel, ts, text string) error {
 	body := map[string]any{"channel": channel, "ts": ts, "text": text, "blocks": []any{}}
 	var out slackResponse
-	return c.call(ctx, "chat.update", body, &out)
+	return c.call(ctx, c.token, "chat.update", body, &out)
 }
 
 // PostBlockMessage posts a Block Kit message into a thread. text is the
@@ -100,13 +110,13 @@ func (c *SlackClient) PostBlockMessage(ctx context.Context, channel, threadTS, t
 		body["thread_ts"] = threadTS
 	}
 	var out slackResponse
-	if err := c.call(ctx, "chat.postMessage", body, &out); err != nil {
+	if err := c.call(ctx, c.token, "chat.postMessage", body, &out); err != nil {
 		return "", err
 	}
 	return out.TS, nil
 }
 
-func (c *SlackClient) call(ctx context.Context, method string, body map[string]any, out *slackResponse) error {
+func (c *SlackClient) call(ctx context.Context, token, method string, body map[string]any, out *slackResponse) error {
 	raw, err := json.Marshal(body)
 	if err != nil {
 		return err
@@ -116,7 +126,7 @@ func (c *SlackClient) call(ctx context.Context, method string, body map[string]a
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json; charset=utf-8")
-	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Authorization", "Bearer "+token)
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return fmt.Errorf("slack %s: %w", method, err)
@@ -134,35 +144,6 @@ func (c *SlackClient) call(ctx context.Context, method string, body map[string]a
 	}
 	if !out.OK {
 		return fmt.Errorf("slack %s: %s", method, out.Error)
-	}
-	return nil
-}
-
-// VerifySlackSignature checks an inbound Events API request against the signing
-// secret: HMAC-SHA256 over "v0:<timestamp>:<rawBody>", compared in constant
-// time, with a five-minute freshness window to blunt replays. rawBody must be
-// the exact bytes Slack sent (the signature is over the wire body).
-func VerifySlackSignature(signingSecret string, header http.Header, rawBody []byte, now time.Time) error {
-	timestamp := header.Get("X-Slack-Request-Timestamp")
-	signature := header.Get("X-Slack-Signature")
-	if timestamp == "" || signature == "" {
-		return fmt.Errorf("missing slack signature headers")
-	}
-	ts, err := strconv.ParseInt(timestamp, 10, 64)
-	if err != nil {
-		return fmt.Errorf("bad slack timestamp %q", timestamp)
-	}
-	if delta := now.Unix() - ts; delta > 300 || delta < -300 {
-		return fmt.Errorf("stale slack timestamp (%ds skew)", delta)
-	}
-	mac := hmac.New(sha256.New, []byte(signingSecret))
-	mac.Write([]byte("v0:"))
-	mac.Write([]byte(timestamp))
-	mac.Write([]byte(":"))
-	mac.Write(rawBody)
-	expected := "v0=" + hex.EncodeToString(mac.Sum(nil))
-	if !hmac.Equal([]byte(expected), []byte(signature)) {
-		return fmt.Errorf("slack signature mismatch")
 	}
 	return nil
 }

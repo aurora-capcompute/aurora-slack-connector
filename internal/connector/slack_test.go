@@ -2,55 +2,13 @@ package connector
 
 import (
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"strconv"
 	"testing"
 	"time"
 )
-
-// signSlack produces the headers Slack would send for a body, for tests and for
-// the handler test below.
-func signSlack(secret, body string, ts time.Time) http.Header {
-	mac := hmac.New(sha256.New, []byte(secret))
-	mac.Write([]byte("v0:" + strconv.FormatInt(ts.Unix(), 10) + ":" + body))
-	h := http.Header{}
-	h.Set("X-Slack-Request-Timestamp", strconv.FormatInt(ts.Unix(), 10))
-	h.Set("X-Slack-Signature", "v0="+hex.EncodeToString(mac.Sum(nil)))
-	return h
-}
-
-func TestVerifySlackSignature(t *testing.T) {
-	secret := "s3cr3t"
-	body := `{"type":"event_callback"}`
-	now := time.Unix(1_700_000_000, 0)
-
-	if err := VerifySlackSignature(secret, signSlack(secret, body, now), []byte(body), now); err != nil {
-		t.Fatalf("valid signature rejected: %v", err)
-	}
-	// Wrong secret.
-	if err := VerifySlackSignature(secret, signSlack("other", body, now), []byte(body), now); err == nil {
-		t.Fatal("signature under wrong secret accepted")
-	}
-	// Tampered body.
-	if err := VerifySlackSignature(secret, signSlack(secret, body, now), []byte(body+"x"), now); err == nil {
-		t.Fatal("tampered body accepted")
-	}
-	// Stale timestamp (10 minutes old).
-	stale := signSlack(secret, body, now.Add(-10*time.Minute))
-	if err := VerifySlackSignature(secret, stale, []byte(body), now); err == nil {
-		t.Fatal("stale timestamp accepted")
-	}
-	// Missing headers.
-	if err := VerifySlackSignature(secret, http.Header{}, []byte(body), now); err == nil {
-		t.Fatal("missing headers accepted")
-	}
-}
 
 func TestSlackClientCalls(t *testing.T) {
 	var gotAuth, gotPost, gotUpdate bool

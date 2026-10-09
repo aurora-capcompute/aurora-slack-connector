@@ -4,16 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
-	"net/url"
 	"strings"
 	"time"
 )
 
 // Human-in-the-loop: when a process is parked on a pending approval task, the
 // connector posts an interactive Approve/Deny prompt into the thread. A click
-// arrives at the interactions endpoint, is verified, and is turned into a
+// arrives over the Socket Mode connection and is turned into a
 // POST /v1/tasks/{id}/resolve — after which aurora resumes the parked process
 // and the poll loop carries on to the answer.
 
@@ -123,7 +120,7 @@ func escapeMrkdwn(s string) string {
 	return strings.ReplaceAll(s, "```", "'''")
 }
 
-// --- interactions endpoint ---
+// --- button clicks ---
 
 // interactionPayload is the subset of Slack's block_actions payload we use.
 type interactionPayload struct {
@@ -145,41 +142,7 @@ type interactionPayload struct {
 	} `json:"actions"`
 }
 
-// handleInteractions receives interactive component events (button clicks).
-// Slack sends them form-encoded with a single `payload` field; the signature
-// still covers the raw body, so it is verified before anything is parsed.
-func (c *Connector) handleInteractions(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes))
-	if err != nil {
-		http.Error(w, "read error", http.StatusBadRequest)
-		return
-	}
-	if err := VerifySlackSignature(c.cfg.SlackSigningSecret, r.Header, body, time.Now()); err != nil {
-		c.logger.Warn("rejected slack interaction", "error", err)
-		http.Error(w, "invalid signature", http.StatusUnauthorized)
-		return
-	}
-	form, err := url.ParseQuery(string(body))
-	if err != nil {
-		http.Error(w, "bad form", http.StatusBadRequest)
-		return
-	}
-	raw := form.Get("payload")
-	if raw == "" {
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-	var p interactionPayload
-	if err := json.Unmarshal([]byte(raw), &p); err != nil {
-		c.logger.Warn("decode interaction payload", "error", err)
-		http.Error(w, "bad payload", http.StatusBadRequest)
-		return
-	}
-	w.WriteHeader(http.StatusOK) // ack fast; resolve asynchronously
-	go c.handleInteraction(p)
-}
-
-// handleInteraction maps a verified button click to a task resolution.
+// handleInteraction maps a button click to a task resolution or a retry.
 func (c *Connector) handleInteraction(p interactionPayload) {
 	if p.Type != "block_actions" || len(p.Actions) == 0 {
 		return

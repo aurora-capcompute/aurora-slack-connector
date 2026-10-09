@@ -3,9 +3,7 @@ package connector
 import (
 	"context"
 	"encoding/json"
-	"io"
 	"log/slog"
-	"net/http"
 	"regexp"
 	"strings"
 	"sync"
@@ -15,8 +13,8 @@ import (
 const (
 	// inboxBuffer bounds the messages queued for one thread's worker.
 	inboxBuffer = 64
-	// maxBodyBytes caps an inbound Slack request body.
-	maxBodyBytes = 1 << 20
+	// maxMessageBytes caps one message from Slack.
+	maxMessageBytes = 1 << 20
 	// seenCapacity bounds the event-dedup memory.
 	seenCapacity = 4096
 	// idleTimeout retires a thread worker after a spell of no messages; its
@@ -24,8 +22,8 @@ const (
 	idleTimeout = 30 * time.Minute
 )
 
-// Connector wires Slack to a local aurora-dist. It receives Slack events over
-// HTTP, maps each thread to an aurora session, and runs each user message as a
+// Connector wires Slack to a local aurora-dist. It receives Slack events over a
+// Socket Mode connection, maps each thread to an aurora session, and runs each user message as a
 // process (an "aurora spawn") in that session — serialized per thread so the
 // session's single-active-process rule holds and history is shared across
 // messages. While a process runs it polls aurora and narrates the syscalls back
@@ -98,30 +96,13 @@ func (c *Connector) Start(ctx context.Context) {
 	}
 }
 
-// Handler returns the connector's HTTP mux: the Slack events endpoint plus a
-// health check.
-func (c *Connector) Handler() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST "+c.cfg.EventsPath, c.handleEvents)
-	if p := c.cfg.InteractionsPath; p != "" && p != c.cfg.EventsPath {
-		// Interactive Approve/Deny button clicks land here (Slack's
-		// Interactivity request URL) — the human-in-the-loop path.
-		mux.HandleFunc("POST "+p, c.handleInteractions)
-	}
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
-	})
-	return mux
-}
-
 // --- Slack event ingestion ---
 
+// slackEnvelope is the payload of an events_api message: an event_callback
+// that wraps one event.
 type slackEnvelope struct {
-	Type      string     `json:"type"`
-	Challenge string     `json:"challenge"`
-	EventID   string     `json:"event_id"`
-	Event     slackEvent `json:"event"`
+	Type  string     `json:"type"`
+	Event slackEvent `json:"event"`
 }
 
 type slackEvent struct {
@@ -133,36 +114,6 @@ type slackEvent struct {
 	TS       string `json:"ts"`
 	ThreadTS string `json:"thread_ts"`
 	Channel  string `json:"channel"`
-}
-
-func (c *Connector) handleEvents(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes))
-	if err != nil {
-		http.Error(w, "read error", http.StatusBadRequest)
-		return
-	}
-	if err := VerifySlackSignature(c.cfg.SlackSigningSecret, r.Header, body, time.Now()); err != nil {
-		c.logger.Warn("rejected slack request", "error", err)
-		http.Error(w, "invalid signature", http.StatusUnauthorized)
-		return
-	}
-	var env slackEnvelope
-	if err := json.Unmarshal(body, &env); err != nil {
-		http.Error(w, "bad json", http.StatusBadRequest)
-		return
-	}
-	// The one-time endpoint verification handshake echoes the challenge.
-	if env.Type == "url_verification" {
-		w.Header().Set("Content-Type", "text/plain")
-		_, _ = w.Write([]byte(env.Challenge))
-		return
-	}
-	// Ack fast (Slack demands a 200 within 3s) and do the work asynchronously —
-	// the downstream aurora calls must not hold the response open.
-	w.WriteHeader(http.StatusOK)
-	if env.Type == "event_callback" {
-		go c.dispatchEvent(env)
-	}
 }
 
 // dispatchEvent filters an inbound event to the messages this duty bot acts on
