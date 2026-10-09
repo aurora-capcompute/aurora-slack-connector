@@ -76,9 +76,9 @@ type step struct {
 	active bool
 }
 
-// maxTimelineSteps caps how many recent steps a status message shows, so a long
+// maxTrailIcons caps the icon trail of a status message, so a long
 // investigation does not grow an unbounded Slack message.
-const maxTimelineSteps = 10
+const maxTrailIcons = 60
 
 // buildTimeline folds a process's journal into a compact, human-readable list
 // of steps: consecutive syscalls of the same kind collapse into one line with a
@@ -111,32 +111,44 @@ func buildTimeline(entries []JournalEntry, running bool) []step {
 }
 
 // renderStatus produces the text of the single status message the connector
-// keeps updated in the thread as a process runs. header names the phase; the
-// timeline narrates the syscalls.
+// keeps updated in the thread as a process runs: the header, a trail of one
+// icon per step, and, while the process runs, the latest step in words. When
+// the process has ended, the header counts the steps instead.
 func renderStatus(header string, entries []JournalEntry, running bool) string {
-	var b strings.Builder
-	b.WriteString(header)
-
 	steps := buildTimeline(entries, running)
 	if len(steps) == 0 {
-		return b.String()
+		return header
+	}
+	var b strings.Builder
+	b.WriteString(header)
+	if !running {
+		calls := 0
+		for _, s := range steps {
+			calls += s.count
+		}
+		fmt.Fprintf(&b, " · %d steps", calls)
 	}
 
-	start := 0
-	if len(steps) > maxTimelineSteps {
-		start = len(steps) - maxTimelineSteps
-		fmt.Fprintf(&b, "\n> …(%d earlier steps)", start)
+	// Every label starts with its icon.
+	icons := make([]string, 0, len(steps))
+	for _, s := range steps {
+		icon, _, _ := strings.Cut(s.label, " ")
+		icons = append(icons, icon)
 	}
-	for _, s := range steps[start:] {
-		line := s.label
-		if s.count > 1 {
-			line = fmt.Sprintf("%s ×%d", line, s.count)
+	b.WriteString("\n")
+	if len(icons) > maxTrailIcons {
+		b.WriteString("… ")
+		icons = icons[len(icons)-maxTrailIcons:]
+	}
+	b.WriteString(strings.Join(icons, " "))
+
+	if running {
+		latest := steps[len(steps)-1]
+		b.WriteString("\n")
+		b.WriteString(latest.label)
+		if latest.active {
+			b.WriteString("…")
 		}
-		if s.active {
-			line += " …"
-		}
-		b.WriteString("\n> ")
-		b.WriteString(line)
 	}
 	return b.String()
 }

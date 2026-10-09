@@ -48,10 +48,13 @@ and in the manifest you give it.
   so the connector queues later mentions in a thread. Different threads run in
   parallel.
 - **Progress by polling.** While a process runs, the connector polls Aurora and
-  keeps one status message up to date: `🧠 Thinking`, `🌐 Reading
-  status.example.com`, `🔌 Calling search_onyx`, `🖥️ Running kubectl-get`.
-  A `…` marks the call in progress. Savepoints and other housekeeping calls
-  are not shown. Then it posts the answer as a new message.
+  keeps one status message up to date. The message has a row of icons, one per
+  step (`🧠` thinking, `🌐` reading a page, `🔌` calling a service, `🖥️`
+  running a command, `🗒️` notes), and the latest step in words, such as
+  `🔌 Calling search_onyx…`. A `…` marks a call in progress. Savepoints, saved
+  results and other housekeeping calls are not shown. When the process ends,
+  the message keeps the row and counts the steps, and the connector posts the
+  answer as a new message.
 - **Interrupted and failed runs.** A run can stop before it finishes: past the
   server's time limit (`quantum_deadline_seconds`), or cut off by a restart. It
   can also fail, for example when an LLM call still fails after the driver's

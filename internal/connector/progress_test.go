@@ -1,6 +1,9 @@
 package connector
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func entry(name, status string) JournalEntry {
 	e := JournalEntry{}
@@ -44,29 +47,36 @@ func TestBuildTimelineNotRunningHasNoActive(t *testing.T) {
 	}
 }
 
-func TestRenderStatusIncludesHeaderAndTimeline(t *testing.T) {
+// While a process runs, the status shows one icon per step and the latest step
+// in words. When it has ended, the header counts the steps and the trail stays.
+func TestRenderStatusShowsTheTrailAndTheLatestStep(t *testing.T) {
 	entries := []JournalEntry{
 		entry("sys.input", "result"),
+		entry("core.openaiApi", "result"),
+		entry("core.openaiApi", "result"),
 		entry("core.internet", "yield"),
 	}
-	got := renderStatus("HEAD", entries, true)
-	if want := "HEAD"; got[:len(want)] != want {
-		t.Fatalf("missing header: %q", got)
+	running := renderStatus("HEAD", entries, true)
+	if want := "HEAD\n📥 🧠 🌐\n" + syscallLabel("core.internet", nil) + "…"; running != want {
+		t.Fatalf("running status = %q, want %q", running, want)
 	}
-	if !contains(got, "Reading the web") {
-		t.Fatalf("missing internet step: %q", got)
+	entries[3].Outcome.Status = "result"
+	done := renderStatus("DONE", entries, false)
+	if want := "DONE · 4 steps\n📥 🧠 🌐"; done != want {
+		t.Fatalf("done status = %q, want %q", done, want)
 	}
 }
 
-func TestRenderStatusCapsSteps(t *testing.T) {
+func TestRenderStatusCapsTheTrail(t *testing.T) {
 	var entries []JournalEntry
 	names := []string{"core.internet", "core.scratch", "core.openaiApi"}
-	for i := 0; i < 40; i++ {
+	for i := 0; i < 100; i++ {
 		entries = append(entries, entry(names[i%len(names)], "result"))
 	}
 	got := renderStatus("H", entries, false)
-	if !contains(got, "earlier steps") {
-		t.Fatalf("expected a truncation notice for a long timeline: %q", got)
+	_, trail, _ := strings.Cut(got, "\n")
+	if !strings.HasPrefix(trail, "… ") || len(strings.Fields(trail)) != maxTrailIcons+1 {
+		t.Fatalf("trail = %q, want … and the last %d icons", trail, maxTrailIcons)
 	}
 }
 
