@@ -273,7 +273,7 @@ func (c *AuroraClient) EnsureSession(ctx context.Context, name string, tags map[
 
 // CreateProcess starts a process on a session — the aurora spawn. input is the
 // user's message; manifest is the opaque grant set (LLM config, capabilities)
-// passed through verbatim. Omitted (nil) means an empty composition.
+// passed through verbatim. Aurora refuses a process without one.
 func (c *AuroraClient) CreateProcess(ctx context.Context, sessionID, input string, manifest json.RawMessage) (ProcessSnapshot, error) {
 	body := map[string]any{"input": input}
 	if len(manifest) > 0 {
