@@ -1,10 +1,10 @@
 // Command aurora-slack-connector bridges one Slack channel to a local
 // aurora-dist instance over Slack's Socket Mode, turning it into an on-call
-// "duty bot": mention it (or use the configured trigger) in the channel and it opens
-// an aurora session for the thread, runs your message as a process, and narrates
-// the syscalls back into the thread while it works. Follow-up messages in the
-// thread run as further processes in the same session, so the investigation
-// shares history.
+// "duty bot": mention it in the channel and it opens an aurora session for the
+// thread, runs your message as a process, and narrates the syscalls back into
+// the thread while it works. Each later mention in the thread runs as a further
+// process in the same session, with the thread's messages since the previous
+// mention, so the investigation shares history.
 //
 // Configuration is entirely by environment variable — see LoadConfig and the
 // README. The connector holds no secrets of its own: the LLM endpoint and the

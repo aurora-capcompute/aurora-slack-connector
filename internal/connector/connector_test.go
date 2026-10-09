@@ -137,17 +137,19 @@ func (s *auroraStub) getSession(w http.ResponseWriter, r *http.Request) {
 		sessionID, active, id, status, answer, entries)
 }
 
-// slackStub records posts and updates and streams post texts on a channel.
+// slackStub records posts and updates and streams post texts on a channel. Its
+// threads map a thread ts to the JSON array conversations.replies returns.
 type slackStub struct {
 	server  *httptest.Server
 	mu      sync.Mutex
 	posts   int
 	updates int
 	postCh  chan string
+	threads map[string]string
 }
 
 func newSlackStub() *slackStub {
-	s := &slackStub{postCh: make(chan string, 64)}
+	s := &slackStub{postCh: make(chan string, 64), threads: map[string]string{}}
 	s.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		var in map[string]any
@@ -173,6 +175,14 @@ func newSlackStub() *slackStub {
 			s.updates++
 			s.mu.Unlock()
 			_, _ = w.Write([]byte(`{"ok":true}`))
+		case "/conversations.replies":
+			s.mu.Lock()
+			messages, ok := s.threads[r.URL.Query().Get("ts")]
+			s.mu.Unlock()
+			if !ok {
+				messages = "[]"
+			}
+			fmt.Fprintf(w, `{"ok":true,"messages":%s}`, messages)
 		default:
 			http.NotFound(w, r)
 		}
@@ -187,7 +197,6 @@ func newTestConnector(t *testing.T, a *auroraStub, sl *slackStub) *Connector {
 	t.Helper()
 	cfg := Config{
 		ChannelID:      "C1",
-		TriggerKeyword: "@duty",
 		AuroraBaseURL:  a.server.URL,
 		Manifest:       json.RawMessage(`{"version":4}`),
 		PollInterval:   5 * time.Millisecond,
@@ -242,7 +251,7 @@ func TestConnectorEndToEnd(t *testing.T) {
 	}
 
 	// A mention opens a new thread → new session → process → answer.
-	conn.dispatchEvent(mentionEvent("U1", "<@UBOT> @duty why is checkout 500ing?", "100.1", ""))
+	conn.dispatchEvent(mentionEvent("U1", "<@UBOT> why is checkout 500ing?", "100.000100", ""))
 	answer := waitForPost(t, sl.postCh, "Re: why is checkout 500ing?", 3*time.Second)
 	if !strings.Contains(answer, "Re: why is checkout 500ing?") {
 		t.Fatalf("answer text = %q", answer)
@@ -258,14 +267,24 @@ func TestConnectorEndToEnd(t *testing.T) {
 	if sc != 1 || pc != 1 {
 		t.Fatalf("want 1 session / 1 process, got %d / %d", sc, pc)
 	}
-	if name != "slack:100.1" {
-		t.Fatalf("session name = %q, want slack:100.1", name)
+	if name != "slack:100.000100" {
+		t.Fatalf("session name = %q, want slack:100.000100", name)
 	}
 
-	// A follow-up in the same thread reuses the session (shared history) and
-	// runs a second process — no new session.
-	conn.dispatchEvent(mentionEvent("U1", "any recent deploys?", "100.2", "100.1"))
-	waitForPost(t, sl.postCh, "Re: any recent deploys?", 3*time.Second)
+	// People talk in the thread, then mention the bot again. The second mention
+	// reuses the session and its input carries the chatter.
+	sl.mu.Lock()
+	sl.threads["100.000100"] = `[
+		{"user":"U1","text":"<@UBOT> why is checkout 500ing?","ts":"100.000100"},
+		{"user":"UBOT","text":"Re: why is checkout 500ing?","ts":"100.000110"},
+		{"user":"U2","text":"the deploy at 14:02 looks suspicious","ts":"100.000120"},
+		{"user":"U1","text":"<@UBOT> any recent deploys?","ts":"100.000200"}]`
+	sl.mu.Unlock()
+	conn.dispatchEvent(mentionEvent("U1", "<@UBOT> any recent deploys?", "100.000200", "100.000100"))
+	followUp := waitForPost(t, sl.postCh, "Request: any recent deploys?", 3*time.Second)
+	if !strings.Contains(followUp, "<@U2>: the deploy at 14:02 looks suspicious") {
+		t.Fatalf("the follow-up input lost the thread's chatter: %q", followUp)
+	}
 
 	a.mu.Lock()
 	sc, pc = a.sessionCreates, a.processCreates
@@ -286,11 +305,9 @@ func TestConnectorEndToEnd(t *testing.T) {
 	}
 }
 
-// A native @-mention is delivered as both an app_mention and a message with the
-// same ts; dedup keeps only one. The trigger decision must not depend on which
-// sibling wins, so the message-typed sibling (no literal keyword) must still
-// open a thread — otherwise ~half of first-contact mentions are dropped.
-func TestMessageSiblingOfNativeMentionTriggers(t *testing.T) {
+// Only a direct mention of the bot starts work. Other messages, in the thread
+// or out of it, start nothing: they reach aurora with the next mention.
+func TestOnlyADirectMentionStartsWork(t *testing.T) {
 	a := newAuroraStub()
 	defer a.close()
 	sl := newSlackStub()
@@ -298,17 +315,51 @@ func TestMessageSiblingOfNativeMentionTriggers(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	conn := newTestConnector(t, a, sl)
-	conn.Start(ctx) // resolves botUserID = UBOT
+	conn.Start(ctx)
 
-	ev := mentionEvent("U1", "<@UBOT> check the db", "200.1", "")
-	ev.Event.Type = "message" // the message sibling, not app_mention
-	conn.dispatchEvent(ev)
-
+	conn.dispatchEvent(mentionEvent("U1", "<@UBOT> check the db", "200.000100", ""))
 	waitForPost(t, sl.postCh, "Re: check the db", 3*time.Second)
+
+	chatter := mentionEvent("U2", "the db is fine from here", "200.000200", "200.000100")
+	chatter.Event.Type = "message"
+	conn.dispatchEvent(chatter)
+
+	time.Sleep(150 * time.Millisecond)
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.processCreates != 1 {
-		t.Fatalf("native mention via message event did not trigger: %d processes", a.processCreates)
+		t.Fatalf("a message without a mention started a process: %d processes", a.processCreates)
+	}
+}
+
+// threadInput carries every message after the previous mention of the bot and
+// before this one, whole: people and other integrations, not the bot's own
+// posts.
+func TestThreadInputCarriesTheMessagesSinceThePreviousMention(t *testing.T) {
+	sl := newSlackStub()
+	defer sl.close()
+	sl.threads["300.000100"] = `[
+		{"user":"U1","text":"<@UBOT> first question","ts":"300.000100"},
+		{"user":"UBOT","text":"first answer","ts":"300.000110"},
+		{"user":"U2","text":"the deploy went out at 14:02","ts":"300.000120"},
+		{"bot_id":"B9","username":"alertbot","text":"CPU above 90%","ts":"300.000130"},
+		{"user":"U1","text":"<@UBOT> what changed?","ts":"300.000140"},
+		{"user":"U3","text":"a later message","ts":"300.000150"}]`
+	slack := NewSlackClient("xoxb-test", time.Second)
+	slack.baseURL = sl.server.URL
+	conn := New(Config{ChannelID: "C1", BotUserID: "UBOT"}, nil, slack, discardLogger())
+
+	input, err := conn.threadInput(context.Background(), &thread{threadTS: "300.000100"},
+		work{text: "what changed?", ts: "300.000140"})
+	if err != nil {
+		t.Fatalf("thread input: %v", err)
+	}
+	want := "Thread messages since you were last mentioned:\n" +
+		"[1970-01-01T00:05:00Z] <@U2>: the deploy went out at 14:02\n" +
+		"[1970-01-01T00:05:00Z] alertbot: CPU above 90%\n\n" +
+		"Request: what changed?"
+	if input != want {
+		t.Fatalf("input =\n%s\nwant\n%s", input, want)
 	}
 }
 
@@ -360,12 +411,10 @@ func TestConnectorDedupSameMessage(t *testing.T) {
 	conn := newTestConnector(t, a, sl)
 	conn.Start(ctx)
 
-	// The same user message delivered as both app_mention and message (same ts).
-	appM := mentionEvent("U1", "<@UBOT> investigate", "7.7", "")
-	msg := appM
-	msg.Event.Type = "message"
-	conn.dispatchEvent(appM)
-	conn.dispatchEvent(msg)
+	// Slack delivers the same mention again (same channel and ts).
+	mention := mentionEvent("U1", "<@UBOT> investigate", "7.7", "")
+	conn.dispatchEvent(mention)
+	conn.dispatchEvent(mention)
 
 	waitForPost(t, sl.postCh, "Re: investigate", 3*time.Second)
 	time.Sleep(100 * time.Millisecond)
@@ -376,23 +425,17 @@ func TestConnectorDedupSameMessage(t *testing.T) {
 	}
 }
 
-func TestCleanTextAndTrigger(t *testing.T) {
-	conn := New(Config{TriggerKeyword: "@duty"}, nil, nil, discardLogger())
+// cleanText removes only the bot's own mention: other mentions name people.
+func TestCleanTextStripsOnlyTheBotsMention(t *testing.T) {
+	conn := New(Config{BotUserID: "UBOT"}, nil, nil, discardLogger())
 	cases := []struct{ in, want string }{
 		{"<@UBOT> why is it down?", "why is it down?"},
-		{"@duty check the db", "check the db"},
-		{"<@UBOT>   @duty   restart   the   worker  ", "restart the worker"},
+		{"<@UBOT>   ask   <@U2>   about the db  ", "ask <@U2> about the db"},
 		{"plain text", "plain text"},
 	}
 	for _, c := range cases {
 		if got := conn.cleanText(c.in); got != c.want {
 			t.Errorf("cleanText(%q) = %q, want %q", c.in, got, c.want)
 		}
-	}
-	if !conn.hasTrigger("hey @DUTY help") {
-		t.Error("hasTrigger should be case-insensitive")
-	}
-	if conn.hasTrigger("no keyword here") {
-		t.Error("hasTrigger false positive")
 	}
 }

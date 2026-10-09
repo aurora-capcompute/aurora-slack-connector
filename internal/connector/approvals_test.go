@@ -164,6 +164,8 @@ func newHITLSlack() *hitlSlack {
 			text, _ := in["text"].(string)
 			s.updateCh <- text
 			_, _ = w.Write([]byte(`{"ok":true}`))
+		case "/conversations.replies":
+			_, _ = w.Write([]byte(`{"ok":true,"messages":[]}`))
 		default:
 			http.NotFound(w, r)
 		}
@@ -181,7 +183,6 @@ func TestApprovalEndToEnd(t *testing.T) {
 
 	cfg := Config{
 		ChannelID:      "C1",
-		TriggerKeyword: "@duty",
 		AuroraBaseURL:  a.server.URL,
 		Manifest:       json.RawMessage(`{"version":4}`),
 		PollInterval:   5 * time.Millisecond,

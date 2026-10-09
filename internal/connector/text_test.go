@@ -15,8 +15,8 @@ func TestNormalizeInputPreservesLineBreaks(t *testing.T) {
 }
 
 func TestCleanTextKeepsMultilineBody(t *testing.T) {
-	conn := New(Config{TriggerKeyword: "@duty"}, nil, nil, discardLogger())
-	in := "<@UBOT> @duty here is the trace:\n  at foo()\n  at bar()"
+	conn := New(Config{BotUserID: "UBOT"}, nil, nil, discardLogger())
+	in := "<@UBOT> here is the trace:\n  at foo()\n  at bar()"
 	got := conn.cleanText(in)
 	want := "here is the trace:\nat foo()\nat bar()"
 	if got != want {
@@ -25,7 +25,7 @@ func TestCleanTextKeepsMultilineBody(t *testing.T) {
 }
 
 func TestCleanTextStripsLabelledMention(t *testing.T) {
-	conn := New(Config{}, nil, nil, discardLogger())
+	conn := New(Config{BotUserID: "U123"}, nil, nil, discardLogger())
 	if got := conn.cleanText("<@U123|dutybot> status?"); got != "status?" {
 		t.Fatalf("labelled mention not stripped: %q", got)
 	}

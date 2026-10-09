@@ -8,10 +8,12 @@
 //
 //   - Each Slack thread is one aurora session (named "slack:<thread_ts>"), so a
 //     thread reattaches to its session by name across connector restarts.
-//   - Each user message runs as one process (an "aurora spawn") in that
-//     session. A per-thread worker goroutine serializes them, honouring
-//     aurora's one-active-process-per-session rule; because aurora seeds each
-//     process with the session history, messages in a thread share context.
+//   - Each direct mention of the bot runs as one process (an "aurora spawn") in
+//     that session. Its input is the thread's messages since the previous
+//     mention, read from Slack, then the mention's text. A per-thread worker
+//     goroutine serializes the mentions, honouring aurora's
+//     one-active-process-per-session rule; because aurora seeds each process
+//     with the session history, mentions in a thread share context.
 //   - While a process runs, the connector polls aurora and keeps a status
 //     message current with the syscall timeline, then posts the answer.
 //   - When a process parks on a pending approval task, the connector posts

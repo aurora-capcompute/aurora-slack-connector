@@ -7,13 +7,15 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
 
 // SlackClient calls the Slack Web API: auth.test to learn the bot's identity at
-// startup, chat.postMessage / chat.update to speak in a thread, and
-// apps.connections.open to start a Socket Mode connection. Just enough of the
+// startup, chat.postMessage / chat.update to speak in a thread,
+// conversations.replies to read a thread, and apps.connections.open to start a
+// Socket Mode connection. Just enough of the
 // API for a single-channel duty bot, over the standard library — no SDK.
 type SlackClient struct {
 	token   string
@@ -54,6 +56,21 @@ type slackResponse struct {
 	Team   string `json:"team"`
 	// apps.connections.open
 	URL string `json:"url"`
+	// conversations.replies
+	Messages         []slackMessage `json:"messages"`
+	HasMore          bool           `json:"has_more"`
+	ResponseMetadata struct {
+		NextCursor string `json:"next_cursor"`
+	} `json:"response_metadata"`
+}
+
+// slackMessage is one message of a thread, as conversations.replies returns it.
+type slackMessage struct {
+	User     string `json:"user"`
+	BotID    string `json:"bot_id"`
+	Username string `json:"username"`
+	Text     string `json:"text"`
+	TS       string `json:"ts"`
 }
 
 // AuthTest returns the bot's own user id, so the connector can strip the leading
@@ -75,6 +92,28 @@ func (c *SlackClient) OpenConnection(ctx context.Context, appToken string) (stri
 		return "", err
 	}
 	return out.URL, nil
+}
+
+// Replies returns every message of a thread, the parent first and oldest
+// first. It reads all pages.
+func (c *SlackClient) Replies(ctx context.Context, channel, threadTS string) ([]slackMessage, error) {
+	var messages []slackMessage
+	cursor := ""
+	for {
+		query := url.Values{"channel": {channel}, "ts": {threadTS}, "limit": {"200"}}
+		if cursor != "" {
+			query.Set("cursor", cursor)
+		}
+		var out slackResponse
+		if err := c.get(ctx, "conversations.replies", query, &out); err != nil {
+			return nil, err
+		}
+		messages = append(messages, out.Messages...)
+		cursor = out.ResponseMetadata.NextCursor
+		if !out.HasMore || cursor == "" {
+			return messages, nil
+		}
+	}
 }
 
 // PostMessage posts text into a thread and returns the new message's ts (its
@@ -126,6 +165,20 @@ func (c *SlackClient) call(ctx context.Context, token, method string, body map[s
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+	return c.send(req, token, method, out)
+}
+
+// get calls a read method with its arguments in the query string: Slack's read
+// methods do not take a JSON body.
+func (c *SlackClient) get(ctx context.Context, method string, query url.Values, out *slackResponse) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/"+method+"?"+query.Encode(), nil)
+	if err != nil {
+		return err
+	}
+	return c.send(req, c.token, method, out)
+}
+
+func (c *SlackClient) send(req *http.Request, token, method string, out *slackResponse) error {
 	req.Header.Set("Authorization", "Bearer "+token)
 	resp, err := c.http.Do(req)
 	if err != nil {

@@ -27,10 +27,6 @@ type Config struct {
 	// ChannelID is the single channel this connector serves. Events from any
 	// other channel are ignored — a duty bot owns exactly one room.
 	ChannelID string
-	// TriggerKeyword optionally triggers a new duty thread when a top-level
-	// channel message contains it (e.g. "@duty"). A native @-mention of the bot
-	// (app_mention) always triggers regardless of this.
-	TriggerKeyword string
 	// BotUserID is the bot's own Slack user id. Auto-detected via auth.test when
 	// empty; used to strip the leading mention from a message and to ignore the
 	// bot's own posts.
@@ -67,7 +63,6 @@ func LoadConfig() (Config, error) {
 		SlackBotToken:   strings.TrimSpace(os.Getenv("SLACK_BOT_TOKEN")),
 		SlackAppToken:   strings.TrimSpace(os.Getenv("SLACK_APP_TOKEN")),
 		ChannelID:       strings.TrimSpace(os.Getenv("SLACK_CHANNEL_ID")),
-		TriggerKeyword:  strings.TrimSpace(os.Getenv("SLACK_TRIGGER_KEYWORD")),
 		BotUserID:       strings.TrimSpace(os.Getenv("SLACK_BOT_USER_ID")),
 		SlackAPIBaseURL: strings.TrimSpace(os.Getenv("SLACK_API_BASE_URL")),
 		AuroraBaseURL:   strings.TrimSpace(os.Getenv("AURORA_BASE_URL")),
@@ -75,9 +70,6 @@ func LoadConfig() (Config, error) {
 
 	if cfg.AuroraBaseURL == "" {
 		cfg.AuroraBaseURL = "http://localhost:8080"
-	}
-	if cfg.TriggerKeyword == "" {
-		cfg.TriggerKeyword = "@duty"
 	}
 
 	var err error

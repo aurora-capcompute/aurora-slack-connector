@@ -3,8 +3,9 @@
 A service that turns one Slack channel into a duty bot backed by an
 [aurora-dist](https://github.com/aurora-capcompute/aurora-dist) server. Mention
 the bot, and it opens an Aurora session for the thread, runs your message as a
-process, and reports each syscall in the thread while it works. Later messages
-in the thread run as more processes in the same session.
+process, and reports each syscall in the thread while it works. Each later
+mention in the thread runs as another process in the same session, and it
+carries the thread's messages since the previous mention.
 
 The bot gathers information to help a human handle an incident. When it needs a
 sensitive action, it asks first: a human approves or denies in the thread.
@@ -26,17 +27,25 @@ and in the manifest you give it.
 | Slack | Aurora |
 | --- | --- |
 | a thread | a session named `slack:<thread_ts>`, with tags `source`, `channel`, `thread_ts` |
-| a message in the thread | a process. The message text is its input. |
+| a mention of the bot in the thread | a process. Its input is the thread's messages since the previous mention, then the mention's text. |
+| other messages in the thread | nothing at once. They reach Aurora with the next mention. |
 | the bot's reply | the process's answer |
 | "what is it doing?" | the process's journal. Each syscall becomes a status line. |
 | an approval prompt | a pending task, resolved with `POST /v1/tasks/{id}/resolve` |
 
+- **Only direct mentions.** The bot acts only when someone mentions it. It
+  ignores every other message when it arrives.
+- **The whole thread.** At each mention, the connector reads the thread from
+  Slack and puts every message since the previous mention into the process
+  input, whole and with its time and author. It leaves out the bot's own posts,
+  because its answers are already in the session's history. A first mention in
+  a thread that people started carries the whole thread before it.
 - **Shared history.** Aurora gives each new process its session's history: the
-  input and answer of each completed process before it. So message *n* sees
-  messages *1 … n-1*, unless the manifest sets `"history": false`. The connector
-  finds a thread's session by name, also after a restart.
+  input and answer of each completed process before it, unless the manifest
+  sets `"history": false`. The connector finds a thread's session by name, also
+  after a restart.
 - **One process per thread at a time.** A session runs one process at a time,
-  so the connector queues later messages of a thread. Different threads run in
+  so the connector queues later mentions in a thread. Different threads run in
   parallel.
 - **Progress by polling.** While a process runs, the connector polls Aurora and
   keeps one status message up to date: `🧠 Thinking`, `🌐 Reading
@@ -73,10 +82,10 @@ raise a prompt: the runtime fires them. Any channel member can approve or deny.
 1. **Socket Mode:** turn it on. Create an app-level token with the
    `connections:write` scope, and copy it (`xapp-…`).
 2. **Bot token scopes:** `app_mentions:read`, `channels:history` (or
-   `groups:history` for a private channel), `chat:write`. Install the app and
-   copy the bot token (`xoxb-…`).
-3. **Event Subscriptions:** turn them on, and subscribe to `app_mention` and
-   `message.channels` (or `message.groups`). Socket Mode needs no Request URL.
+   `groups:history` for a private channel) to read a thread, and `chat:write`.
+   Install the app and copy the bot token (`xoxb-…`).
+3. **Event Subscriptions:** turn them on, and subscribe to `app_mention`.
+   Socket Mode needs no Request URL.
 4. **Interactivity:** turn it on. This delivers the button clicks. Socket Mode
    needs no Request URL.
 5. Invite the bot to its one channel and note the channel id (`C…`).
@@ -95,7 +104,6 @@ Slack credentials. The LLM endpoint, keys and grants are in the manifest.
 | `SLACK_CHANNEL_ID` | yes | | The one channel to serve |
 | `AURORA_MANIFEST` or `AURORA_MANIFEST_FILE` | yes | | The manifest for every process (JSON, or a path) |
 | `AURORA_BASE_URL` | | `http://localhost:8080` | The aurora-dist address. A host name other than `localhost` or an IP address must be in aurora-dist's `trusted_hosts`. |
-| `SLACK_TRIGGER_KEYWORD` | | `@duty` | A keyword that starts a thread. A mention of the bot always works. |
 | `SLACK_BOT_USER_ID` | | from `auth.test` | The bot's user id |
 | `SLACK_API_BASE_URL` | | `https://slack.com/api` | For a gateway or for tests |
 | `POLL_INTERVAL` | | `2s` | How often a running process is polled |
@@ -124,7 +132,7 @@ go run ./cmd/aurora-slack-connector
 
 Then, in the channel:
 
-> **@duty** why are we seeing elevated 500s on checkout?
+> **@aurora-bot** why are we seeing elevated 500s on checkout?
 
 ## Test
 
