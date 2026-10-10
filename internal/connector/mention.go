@@ -131,7 +131,7 @@ func (c *Connector) handleRetry(ctx context.Context, t *thread, processID string
 func (c *Connector) spawn(ctx context.Context, sessionID, text string) (ProcessSnapshot, error) {
 	deadline := time.Now().Add(c.cfg.ProcessTimeout)
 	for {
-		proc, err := c.aurora.CreateProcess(ctx, sessionID, text, c.cfg.Manifest)
+		proc, err := c.aurora.CreateProcess(ctx, sessionID, text)
 		if err == nil {
 			return proc, nil
 		}

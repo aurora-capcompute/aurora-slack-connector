@@ -2,7 +2,6 @@ package connector
 
 import (
 	"cmp"
-	"encoding/json"
 	"fmt"
 	"os"
 	"strconv"
@@ -10,11 +9,7 @@ import (
 	"time"
 )
 
-// Config is the connector's full configuration. Everything is supplied by the
-// operator — most importantly the aurora Manifest, which carries the LLM
-// endpoint and API key and the capability grants the duty bot runs with. The
-// connector never invents those: it passes the manifest through to aurora
-// verbatim, so secrets stay in the operator's environment.
+// Config is the connector's full configuration, supplied by the operator.
 type Config struct {
 	// --- Slack ---
 
@@ -40,9 +35,6 @@ type Config struct {
 
 	// AuroraBaseURL is the local aurora-dist address (e.g. http://localhost:8080).
 	AuroraBaseURL string
-	// Manifest is the opaque aurora manifest applied to every process (aurora
-	// spawn) this connector starts. Passed through verbatim.
-	Manifest json.RawMessage
 
 	// --- Polling ---
 
@@ -57,8 +49,7 @@ type Config struct {
 }
 
 // LoadConfig reads configuration from the environment. Required: SLACK_BOT_TOKEN,
-// SLACK_APP_TOKEN, SLACK_CHANNEL_ID, and a manifest (AURORA_MANIFEST inline JSON
-// or AURORA_MANIFEST_FILE path).
+// SLACK_APP_TOKEN and SLACK_CHANNEL_ID.
 func LoadConfig() (Config, error) {
 	cfg := Config{
 		SlackBotToken:   strings.TrimSpace(os.Getenv("SLACK_BOT_TOKEN")),
@@ -80,41 +71,7 @@ func LoadConfig() (Config, error) {
 		return Config{}, err
 	}
 
-	manifest, err := loadManifest()
-	if err != nil {
-		return Config{}, err
-	}
-	cfg.Manifest = manifest
-
 	return cfg, cfg.Validate()
-}
-
-// loadManifest reads the manifest from AURORA_MANIFEST (inline JSON) or
-// AURORA_MANIFEST_FILE (a path), and checks it parses as a JSON object.
-func loadManifest() (json.RawMessage, error) {
-	inline := strings.TrimSpace(os.Getenv("AURORA_MANIFEST"))
-	path := strings.TrimSpace(os.Getenv("AURORA_MANIFEST_FILE"))
-	var raw []byte
-	switch {
-	case inline != "":
-		raw = []byte(inline)
-	case path != "":
-		b, err := os.ReadFile(path)
-		if err != nil {
-			return nil, fmt.Errorf("read AURORA_MANIFEST_FILE: %w", err)
-		}
-		raw = b
-	default:
-		return nil, nil
-	}
-	var probe map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &probe); err != nil {
-		return nil, fmt.Errorf("manifest is not a JSON object: %w", err)
-	}
-	// Re-marshal to a compact canonical form so it travels cleanly in the
-	// process-create request body.
-	compact, _ := json.Marshal(probe)
-	return compact, nil
 }
 
 func durationEnv(key string, def time.Duration) (time.Duration, error) {
@@ -142,8 +99,6 @@ func (c Config) Validate() error {
 		return fmt.Errorf("SLACK_APP_TOKEN is required")
 	case c.ChannelID == "":
 		return fmt.Errorf("SLACK_CHANNEL_ID is required")
-	case len(c.Manifest) == 0:
-		return fmt.Errorf("a manifest is required (set AURORA_MANIFEST or AURORA_MANIFEST_FILE)")
 	case c.PollInterval <= 0:
 		return fmt.Errorf("POLL_INTERVAL must be positive")
 	case c.ProcessTimeout <= 0:

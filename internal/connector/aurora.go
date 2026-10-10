@@ -227,11 +227,10 @@ func (c *AuroraClient) EnsureSession(ctx context.Context, name string, tags map[
 }
 
 // CreateProcess starts a process on a session — the aurora spawn. input is the
-// user's message; manifest is the opaque grant set (LLM config, capabilities)
-// passed through verbatim.
-func (c *AuroraClient) CreateProcess(ctx context.Context, sessionID, input string, manifest json.RawMessage) (ProcessSnapshot, error) {
+// user's message.
+func (c *AuroraClient) CreateProcess(ctx context.Context, sessionID, input string) (ProcessSnapshot, error) {
 	return call[ProcessSnapshot](ctx, c, http.MethodPost, "/v1/sessions/"+sessionID+"/processes",
-		map[string]any{"input": input, "manifest": manifest})
+		map[string]any{"input": input})
 }
 
 // GetProcess is the cheap status poll.

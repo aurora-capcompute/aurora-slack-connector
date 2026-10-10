@@ -19,8 +19,8 @@ Slack ── events, clicks (Socket Mode) ──▶ ┌────────�
 The connector is a client of aurora-dist's `/v1` API. It does not embed the
 runtime. Slack reaches it over Socket Mode: the connector opens a WebSocket to
 Slack, so it needs no public URL and listens on no port. Its one dependency is
-the WebSocket client. The agent, its capabilities and its secrets live in Aurora
-and in the manifest you give it.
+the WebSocket client. The agent, its capabilities and its secrets live in Aurora,
+in the skills of aurora-dist.
 
 ## How Slack maps onto Aurora
 
@@ -41,8 +41,7 @@ and in the manifest you give it.
   because its answers are already in the session's history. A first mention in
   a thread that people started carries the whole thread before it.
 - **Shared history.** Aurora gives each new process its session's history: the
-  input and answer of each completed process before it, unless the manifest
-  sets `"history": false`. The connector finds a thread's session by name, also
+  input and answer of each completed process before it. The connector finds a thread's session by name, also
   after a restart.
 - **One process per thread at a time.** A session runs one process at a time,
   so the connector queues later mentions in a thread. Different threads run in
@@ -98,14 +97,14 @@ The connector makes only outbound connections: to Slack and to aurora-dist.
 ## Configuration
 
 All configuration comes from the environment. The connector holds only the
-Slack credentials. The LLM endpoint, keys and grants are in the manifest.
+Slack credentials. The LLM endpoint, keys and grants are in aurora-dist's
+skills.
 
 | Variable | Required | Default | Meaning |
 | --- | --- | --- | --- |
 | `SLACK_BOT_TOKEN` | yes | | Bot token (`xoxb-…`) |
 | `SLACK_APP_TOKEN` | yes | | App-level token (`xapp-…`, `connections:write`) for Socket Mode |
 | `SLACK_CHANNEL_ID` | yes | | The one channel to serve |
-| `AURORA_MANIFEST` or `AURORA_MANIFEST_FILE` | yes | | The manifest for every process (JSON, or a path) |
 | `AURORA_BASE_URL` | | `http://localhost:8080` | The aurora-dist address. A host name other than `localhost` or an IP address must be in aurora-dist's `trusted_hosts`. |
 | `SLACK_BOT_USER_ID` | | from `auth.test` | The bot's user id |
 | `SLACK_API_BASE_URL` | | `https://slack.com/api` | For a gateway or for tests |
@@ -115,13 +114,14 @@ Slack credentials. The LLM endpoint, keys and grants are in the manifest.
 
 A duration is a Go duration (`2s`, `10m`) or a number of seconds.
 
-### The manifest
+### The grants
 
-The connector sends the manifest to Aurora unchanged. Start from the minimal
-manifest in the [aurora-dist README](https://github.com/aurora-capcompute/aurora-dist).
-Set `require_approval: true` on every capability that changes something (for
-example a `POST` to an internal endpoint). A Slack message is untrusted input,
-so a gated call needs a human. Read-only lookups can stay ungated.
+The connector sends only the input. The server's skills set the grants of every
+process (see [Skills in the aurora-dist README](https://github.com/aurora-capcompute/aurora-dist#skills)).
+In the skills, set `require_approval: true` on every capability that changes
+something (for example a `POST` to an internal endpoint). A Slack message is
+untrusted input, so a gated call needs a human. Read-only lookups can stay
+ungated.
 
 ## Run
 
@@ -129,7 +129,6 @@ so a gated call needs a human. Read-only lookups can stay ungated.
 export SLACK_BOT_TOKEN=xoxb-...
 export SLACK_APP_TOKEN=xapp-...
 export SLACK_CHANNEL_ID=C0123456789
-export AURORA_MANIFEST_FILE=./duty-manifest.json
 go run ./cmd/aurora-slack-connector
 ```
 

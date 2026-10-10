@@ -8,7 +8,7 @@
 //
 // Configuration is entirely by environment variable — see LoadConfig and the
 // README. The connector holds no secrets of its own: the LLM endpoint and the
-// capability grants live in the aurora manifest the operator supplies.
+// capability grants come from aurora-dist's skills.
 package main
 
 import (

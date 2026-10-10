@@ -76,7 +76,6 @@ func TestEndedProcessOffersRetry(t *testing.T) {
 
 			cfg := Config{
 				ChannelID:      "C1",
-				Manifest:       json.RawMessage(`{"version":4}`),
 				PollInterval:   5 * time.Millisecond,
 				ProcessTimeout: 5 * time.Second,
 				HTTPTimeout:    2 * time.Second,

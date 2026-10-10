@@ -198,7 +198,6 @@ func newTestConnector(t *testing.T, a *auroraStub, sl *slackStub) *Connector {
 	cfg := Config{
 		ChannelID:      "C1",
 		AuroraBaseURL:  a.server.URL,
-		Manifest:       json.RawMessage(`{"version":4}`),
 		PollInterval:   5 * time.Millisecond,
 		ProcessTimeout: 5 * time.Second,
 		HTTPTimeout:    2 * time.Second,

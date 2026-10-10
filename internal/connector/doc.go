@@ -23,9 +23,9 @@
 //     by a restart) or fails, the connector says so and posts a Retry button;
 //     a click resumes the process through POST /v1/processes/{id}/retry.
 //
-// The connector holds no secrets of its own beyond the Slack credentials: the
-// LLM endpoint and the capability grants live in the operator-supplied aurora
-// manifest, which is forwarded to aurora verbatim.
+// The connector holds no secrets of its own beyond the Slack credentials, and
+// it sends no grants: the LLM endpoint and the capabilities come from
+// aurora-dist's skills.
 //
 // File layout:
 //

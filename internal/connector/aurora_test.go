@@ -12,7 +12,7 @@ import (
 )
 
 func TestAuroraClientCreateSessionAndProcess(t *testing.T) {
-	var createdManifest json.RawMessage
+	var sentManifest bool
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/sessions", func(w http.ResponseWriter, r *http.Request) {
 		var in map[string]any
@@ -27,7 +27,7 @@ func TestAuroraClientCreateSessionAndProcess(t *testing.T) {
 		var in map[string]json.RawMessage
 		body, _ := io.ReadAll(r.Body)
 		_ = json.Unmarshal(body, &in)
-		createdManifest = in["manifest"]
+		_, sentManifest = in["manifest"]
 		_, _ = w.Write([]byte(`{"id":"proc_1","session_id":"ses_1","status":"running","journal_length":1}`))
 	})
 	srv := httptest.NewServer(mux)
@@ -40,12 +40,12 @@ func TestAuroraClientCreateSessionAndProcess(t *testing.T) {
 	if err != nil || id != "ses_1" {
 		t.Fatalf("create session: id=%q err=%v", id, err)
 	}
-	proc, err := c.CreateProcess(ctx, "ses_1", "help", json.RawMessage(`{"version":4}`))
+	proc, err := c.CreateProcess(ctx, "ses_1", "help")
 	if err != nil || proc.ID != "proc_1" || proc.Status != StatusRunning {
 		t.Fatalf("create process: %+v err=%v", proc, err)
 	}
-	if string(createdManifest) != `{"version":4}` {
-		t.Fatalf("manifest not forwarded verbatim: %s", createdManifest)
+	if sentManifest {
+		t.Fatal("create process sent a manifest")
 	}
 }
 
