@@ -29,14 +29,16 @@
 //
 // File layout:
 //
-//   - connector.go — the Connector type, lifecycle, event routing, the
-//     per-thread worker, and process polling.
+//   - connector.go — the Connector type and its start.
 //   - socket.go    — the Socket Mode connection: receive, acknowledge, route.
+//   - threads.go   — from an event to the thread's worker.
+//   - mention.go   — one mention as one process: input, polling, outcome.
 //   - approvals.go — the approval prompt and its resolution, and the Retry
 //     button.
+//   - progress.go  — the status message: the syscall journal as a timeline.
 //   - aurora.go    — the aurora-dist HTTP client (sessions, processes, tasks).
 //   - slack.go     — the Slack Web API client.
-//   - progress.go  — rendering the syscall journal as a human status timeline.
+//   - text.go      — bot mentions and chat-line helpers.
 //   - config.go    — environment configuration.
 //   - seen.go      — bounded event de-duplication.
 package connector

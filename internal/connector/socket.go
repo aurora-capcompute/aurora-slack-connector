@@ -10,8 +10,12 @@ import (
 	"github.com/coder/websocket/wsjson"
 )
 
-// reconnectDelay is the pause before a new connection after a failed one.
-const reconnectDelay = 5 * time.Second
+const (
+	// reconnectDelay is the pause before a new connection after a failed one.
+	reconnectDelay = 5 * time.Second
+	// maxMessageBytes caps one message from Slack.
+	maxMessageBytes = 1 << 20
+)
 
 // socketMessage is one message on a Socket Mode connection. A message with an
 // envelope id carries an event or a button click, and Slack sends it again

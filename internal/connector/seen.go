@@ -2,6 +2,9 @@ package connector
 
 import "sync"
 
+// seenCapacity bounds the event-dedup memory.
+const seenCapacity = 4096
+
 // seenSet is a bounded set of recently seen keys for event deduplication. Slack
 // can deliver the same user message twice (once as app_mention, once as
 // message) and retries failed deliveries; both carry the same (channel, ts), so

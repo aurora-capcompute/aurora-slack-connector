@@ -146,3 +146,23 @@ func renderStatus(header string, entries []JournalEntry, running bool) string {
 	}
 	return b.String()
 }
+
+func statusHeader(status string, awaitingApproval bool) string {
+	if awaitingApproval {
+		return "⏸️ *Duty bot — waiting for your approval*"
+	}
+	switch status {
+	case StatusCompleted:
+		return "✅ *Duty bot — done*"
+	case StatusFailed:
+		return "❌ *Duty bot — failed*"
+	case StatusStopped:
+		return "🛑 *Duty bot — stopped*"
+	case StatusInterrupted:
+		return "⏸️ *Duty bot — interrupted*"
+	case StatusWaitingTask:
+		return "🛎️ *Duty bot — working* _(waiting on a timer)_"
+	default:
+		return "🛎️ *Duty bot — working…*"
+	}
+}
