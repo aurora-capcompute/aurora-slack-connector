@@ -49,8 +49,6 @@ func syscallLabel(name string, args json.RawMessage) string {
 		return "🗒️ Checking notes"
 	case "sys.timer":
 		return "⏳ Waiting on a timer"
-	case "sys.declassify":
-		return "🔓 Asking to release labelled data"
 	case "sys.abort":
 		return "↩️ Starting a step again"
 	case "sys.begin", "sys.commit", "sys.log", "sys.now", "sys.random":

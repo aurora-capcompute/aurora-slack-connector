@@ -150,8 +150,8 @@ func TestApprovalPartsReadWell(t *testing.T) {
 			"List pods", "run: \"/bin/sh\" \"get.sh\"\ndir: /srv"},
 		{task("Approve core.openaiApi/chat: chat: create a Chat Completions response\nmodel: gpt-4o", "core.openaiApi", `{}`),
 			"chat: create a Chat Completions response", "model: gpt-4o"},
-		{task("Approve declassifying [secret]: the date is public now", "sys.declassify", `{}`),
-			"declassifying [secret]: the date is public now", ""},
+		{task("Approve core.command/dns-lookup: Resolve one name.\nThis run has read data labeled k8s_data. This call can send that data out of the run.\nk8s_data came from:\n- core.command {\"operation\":\"k8s-logs\"}\nrun: \"/usr/bin/dig\" \"+short\" \"A\" \"x.example.\"", "core.command", `{}`),
+			"Resolve one name.", "This run has read data labeled k8s_data. This call can send that data out of the run.\nk8s_data came from:\n- core.command {\"operation\":\"k8s-logs\"}\nrun: \"/usr/bin/dig\" \"+short\" \"A\" \"x.example.\""},
 		{task("Approve core.internet/GET\nargs: {}", "core.internet", `{"method":"GET","url":"https://status.example.com/x"}`),
 			"🌐 Reading status.example.com", "args: {}"},
 	}
